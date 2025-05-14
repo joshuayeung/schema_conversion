@@ -173,17 +173,17 @@ from pyspark.sql.types import StructType, StructField, ArrayType, MapType
 from pyspark.sql.functions import col, struct, transform
 
 
-def merge_msg_payload_schema(df: DataFrame, golden_schema: StructType) -> DataFrame:
+def merge_msg_payload_schema(df: DataFrame, golden_msg_schema: StructType) -> DataFrame:
     """
-    Merge the `msg_payload` field of a DataFrame's schema with a golden standard schema,
-    adding new fields from the DataFrame while avoiding case-insensitive duplicates.
-    The golden schema takes precedence for duplicate fields.
+    Merge the `msg_payload` field of a DataFrame's schema with a golden standard
+    `msg_payload` schema, adding new fields from the DataFrame while avoiding
+    case-insensitive duplicates. The golden schema takes precedence for duplicates.
 
     Args:
         df: Input PySpark DataFrame with a `msg_payload` field
-        golden_schema: Golden standard schema (e.g., from Iceberg table) with a `msg_payload` field
+        golden_msg_schema: Golden standard schema for `msg_payload` (StructType)
     Returns:
-        DataFrame with merged schema for `msg_payload`
+        DataFrame with merged schema for `msg_payload` and other fields preserved
     """
 
     def normalize_field_name(name: str) -> str:
@@ -207,9 +207,10 @@ def merge_msg_payload_schema(df: DataFrame, golden_schema: StructType) -> DataFr
         new_fields = []
         name_mapping = {}  # Maps original DataFrame paths to new field names
 
-        # First, include all golden schema fields
+        # Include all golden schema fields
         for gold_field in gold_schema.fields:
             field_lower = normalize_field_name(gold_field.name)
+            # Find original DataFrame field name for case-insensitive match
             original_df_name = next(
                 (name for name, field in df_fields.items() if normalize_field_name(name) == field_lower),
                 gold_field.name)
@@ -316,35 +317,33 @@ def merge_msg_payload_schema(df: DataFrame, golden_schema: StructType) -> DataFr
 
         return exprs
 
-    # Extract msg_payload schemas
+    # Extract msg_payload schema from DataFrame
     df_msg_schema = next((f.dataType for f in df.schema.fields if f.name.lower() == "msg_payload"), StructType([]))
-    gold_msg_schema = next((f.dataType for f in golden_schema.fields if f.name.lower() == "msg_payload"),
-                           StructType([]))
 
     # Merge msg_payload schemas
-    merged_msg_schema, name_mapping = merge_schemas(df_msg_schema, gold_msg_schema)
+    merged_msg_schema, name_mapping = merge_schemas(df_msg_schema, golden_msg_schema, prefix="msg_payload.")
 
     # Build new top-level schema
     new_fields = []
-    for field in golden_schema.fields:
+    msg_payload_found = False
+    for field in df.schema.fields:
         if field.name.lower() == "msg_payload":
             new_fields.append(StructField(field.name, merged_msg_schema, field.nullable))
+            msg_payload_found = True
         else:
             new_fields.append(field)
 
-    # Add non-duplicate top-level fields from DataFrame
-    gold_fields = {f.name.lower(): f for f in golden_schema.fields}
-    for field in df.schema.fields:
-        if field.name.lower() not in gold_fields:
-            new_fields.append(field)
+    # Add msg_payload if not in DataFrame
+    if not msg_payload_found:
+        new_fields.append(StructField("msg_payload", merged_msg_schema, True))
 
     merged_schema = StructType(new_fields)
 
-    # Build select expressions for top-level fields
+    # Build select expressions
     top_level_exprs = []
     for field in merged_schema.fields:
         if field.name.lower() == "msg_payload":
-            msg_exprs = build_select_expr(merged_msg_schema, name_mapping)
+            msg_exprs = build_select_expr(merged_msg_schema, name_mapping, prefix="")
             top_level_exprs.append(struct(msg_exprs).alias(field.name))
         else:
             top_level_exprs.append(col(f"`{field.name}`").alias(field.name))
