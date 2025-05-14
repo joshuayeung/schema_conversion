@@ -16,12 +16,14 @@ def replace_spaces_with_underscores(df: DataFrame) -> DataFrame:
 
     def transform_schema(schema, prefix=""):
         new_fields = []
-        name_mapping = {}  # Track original to new names
+        name_mapping = {}  # Track original to new names with full paths
         for field in schema.fields:
             # Store original name and create new name
             original_name = field.name
             new_name = original_name.replace(" ", "_")
-            name_mapping[f"{prefix}{original_name}"] = f"{prefix}{new_name}"
+            original_full_path = f"{prefix}{original_name}"
+            new_full_path = f"{prefix}{new_name}"
+            name_mapping[original_full_path] = new_full_path
 
             # Handle different data types
             if isinstance(field.dataType, StructType):
@@ -34,13 +36,13 @@ def replace_spaces_with_underscores(df: DataFrame) -> DataFrame:
                 nested_schema, nested_mapping = transform_schema(field.dataType.elementType, f"{new_name}.")
                 new_field = StructField(new_name, ArrayType(nested_schema), field.nullable)
                 name_mapping.update({k: v for k, v in nested_mapping.items()})
-            elif isinstance(field.dataType, MapType) and isinstance(field.dataType.workType, StructType):
+            elif isinstance(field.dataType, MapType) and isinstance(field.dataType.valueType, StructType):
                 # Handle map with struct values
                 nested_schema, nested_mapping = transform_schema(field.dataType.valueType, f"{new_name}.")
                 new_field = StructField(new_name, MapType(field.dataType.keyType, nested_schema), field.nullable)
                 name_mapping.update({k: v for k, v in nested_mapping.items()})
             else:
-                # Simple field, just update name
+                # Simple field
                 new_field = StructField(new_name, field.dataType, field.nullable)
 
             new_fields.append(new_field)
@@ -56,12 +58,14 @@ def replace_spaces_with_underscores(df: DataFrame) -> DataFrame:
         for field in schema.fields:
             new_name = field.name
             full_new_name = f"{prefix}{new_name}"
-            # Get original name from mapping
+            # Find original full path from mapping
             original_full_name = next((k for k, v in mapping.items() if v == full_new_name), full_new_name)
 
             if isinstance(field.dataType, StructType):
                 # Handle nested struct
-                nested_exprs = build_select_expr(field.dataType, f"{original_full_name}.", mapping)
+                nested_exprs = build_select_expr(field.dataType, f"{new_name}.", mapping)
+                # Use original nested path for selection
+                original_struct_name = original_full_name
                 exprs.append(struct(nested_exprs).alias(new_name))
             elif isinstance(field.dataType, ArrayType) and isinstance(field.dataType.elementType, StructType):
                 # Handle array of structs
