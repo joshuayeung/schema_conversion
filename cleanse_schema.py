@@ -1,6 +1,6 @@
 from pyspark.sql import DataFrame
 from pyspark.sql.types import StructType, StructField, ArrayType, MapType
-from pyspark.sql.functions import col
+from pyspark.sql.functions import col, struct, transform
 
 
 def replace_spaces_with_underscores(df: DataFrame) -> DataFrame:
@@ -16,60 +16,64 @@ def replace_spaces_with_underscores(df: DataFrame) -> DataFrame:
 
     def transform_schema(schema, prefix=""):
         new_fields = []
+        name_mapping = {}  # Track original to new names
         for field in schema.fields:
-            # Clean field name
-            new_name = field.name.replace(" ", "_")
+            # Store original name and create new name
+            original_name = field.name
+            new_name = original_name.replace(" ", "_")
+            name_mapping[f"{prefix}{original_name}"] = f"{prefix}{new_name}"
 
             # Handle different data types
             if isinstance(field.dataType, StructType):
                 # Recursively process nested struct
-                nested_schema = transform_schema(field.dataType, f"{prefix}{new_name}.")
+                nested_schema, nested_mapping = transform_schema(field.dataType, f"{new_name}.")
                 new_field = StructField(new_name, nested_schema, field.nullable)
+                name_mapping.update(nested_mapping)
             elif isinstance(field.dataType, ArrayType) and isinstance(field.dataType.elementType, StructType):
                 # Handle array of structs
-                nested_schema = transform_schema(field.dataType.elementType, f"{prefix}{new_name}.")
+                nested_schema, nested_mapping = transform_schema(field.dataType.elementType, f"{new_name}.")
                 new_field = StructField(new_name, ArrayType(nested_schema), field.nullable)
-            elif isinstance(field.dataType, MapType) and isinstance(field.dataType.valueType, StructType):
+                name_mapping.update({k: v for k, v in nested_mapping.items()})
+            elif isinstance(field.dataType, MapType) and isinstance(field.dataType.workType, StructType):
                 # Handle map with struct values
-                nested_schema = transform_schema(field.dataType.valueType, f"{prefix}{new_name}.")
+                nested_schema, nested_mapping = transform_schema(field.dataType.valueType, f"{new_name}.")
                 new_field = StructField(new_name, MapType(field.dataType.keyType, nested_schema), field.nullable)
+                name_mapping.update({k: v for k, v in nested_mapping.items()})
             else:
                 # Simple field, just update name
                 new_field = StructField(new_name, field.dataType, field.nullable)
 
             new_fields.append(new_field)
 
-        return StructType(new_fields)
+        return StructType(new_fields), name_mapping
 
-    # Create new schema
-    new_schema = transform_schema(df.schema)
+    # Create new schema and get name mapping
+    new_schema, name_mapping = transform_schema(df.schema)
 
-    # Create new DataFrame with updated schema
-    # We need to select columns with new names
-    def build_select_expr(schema, prefix=""):
+    # Build select expressions using original names
+    def build_select_expr(schema, prefix="", mapping=None):
         exprs = []
         for field in schema.fields:
-            old_name = field.name.replace("_", " ")
             new_name = field.name
-            full_old_name = f"{prefix}{old_name}"
             full_new_name = f"{prefix}{new_name}"
+            # Get original name from mapping
+            original_full_name = next((k for k, v in mapping.items() if v == full_new_name), full_new_name)
 
             if isinstance(field.dataType, StructType):
                 # Handle nested struct
-                nested_exprs = build_select_expr(field.dataType, f"{full_old_name}.")
-                exprs.append(struct(nested_exprs).alias(full_new_name))
+                nested_exprs = build_select_expr(field.dataType, f"{original_full_name}.", mapping)
+                exprs.append(struct(nested_exprs).alias(new_name))
             elif isinstance(field.dataType, ArrayType) and isinstance(field.dataType.elementType, StructType):
                 # Handle array of structs
-                nested_exprs = build_select_expr(field.dataType.elementType, "")
-                exprs.append(transform(col(full_old_name), lambda x: struct(nested_exprs)).alias(full_new_name))
+                nested_exprs = build_select_expr(field.dataType.elementType, "", mapping)
+                exprs.append(transform(col(f"`{original_full_name}`"), lambda x: struct(nested_exprs)).alias(new_name))
             else:
                 # Simple field
-                exprs.append(col(f"`{full_old_name}`").alias(full_new_name))
+                exprs.append(col(f"`{original_full_name}`").alias(new_name))
 
         return exprs
 
-    from pyspark.sql.functions import struct, transform
-    select_expr = build_select_expr(new_schema)
+    select_expr = build_select_expr(new_schema, mapping=name_mapping)
 
     return df.select(select_expr)
 
