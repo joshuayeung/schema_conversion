@@ -1,5 +1,5 @@
 from typing import Union, Dict, List
-from avro.schema import Schema, RecordSchema, ArraySchema, UnionSchema, PrimitiveSchema, MapSchema
+from avro.schema import Schema, RecordSchema, ArraySchema, UnionSchema, PrimitiveSchema, MapSchema, Field
 from pyspark.sql.types import StructType, StructField, ArrayType, MapType, StringType, IntegerType, \
     LongType, DoubleType, FloatType, BooleanType, TimestampType, DateType, BinaryType
 
@@ -19,25 +19,25 @@ def avro_to_pyspark_schema(avro_schema: Union[Schema, str, Dict]) -> StructType:
         avro_schema = avro.schema.parse(avro_schema) if isinstance(avro_schema, str) else \
                      avro.schema.make_avsc_object(avro_schema)
     
-    def _convert_field(field: Dict) -> StructField:
+    def _convert_field(field: Field) -> StructField:
         """Convert a single Avro field to a PySpark StructField."""
-        field_type = field['type']
-        nullable = field.get('nullable', True)
+        field_type = field.type  # Use dot notation instead of subscript
+        nullable = field.has_default  # Avro fields with defaults are typically nullable
         
         # Handle different schema types
         if isinstance(field_type, RecordSchema):
-            return StructField(field['name'], _convert_record(field_type), nullable)
+            return StructField(field.name, _convert_record(field_type), nullable)
         elif isinstance(field_type, ArraySchema):
-            return StructField(field['name'], ArrayType(_convert_type(field_type.items), nullable), nullable)
+            return StructField(field.name, ArrayType(_convert_type(field_type.items), nullable), nullable)
         elif isinstance(field_type, MapSchema):
-            return StructField(field['name'], MapType(StringType(), _convert_type(field_type.values), nullable), nullable)
+            return StructField(field.name, MapType(StringType(), _convert_type(field_type.values), nullable), nullable)
         elif isinstance(field_type, UnionSchema):
             # Handle nullable types in union (e.g., ["null", "string"])
             non_null_types = [t for t in field_type.schemas if t.type != 'null']
             spark_type = _convert_type(non_null_types[0]) if non_null_types else StringType()
-            return StructField(field['name'], spark_type, nullable)
+            return StructField(field.name, spark_type, nullable)
         else:
-            return StructField(field['name'], _convert_type(field_type), nullable)
+            return StructField(field.name, _convert_type(field_type), nullable)
     
     def _convert_type(schema: Schema) -> Union[StructType, ArrayType, MapType, StringType, IntegerType, 
                                              LongType, DoubleType, FloatType, BooleanType, 
