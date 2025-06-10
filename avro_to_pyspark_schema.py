@@ -1,7 +1,7 @@
 from typing import Union, Dict, List
 from avro.schema import Schema, RecordSchema, ArraySchema, UnionSchema, PrimitiveSchema, MapSchema, Field
 from pyspark.sql.types import StructType, StructField, ArrayType, MapType, StringType, IntegerType, \
-    LongType, DoubleType, FloatType, BooleanType, TimestampType, DateType, BinaryType
+    LongType, DoubleType, FloatType, BooleanType, TimestampType, DateType, BinaryType, DecimalType
 
 def avro_to_pyspark_schema(avro_schema: Union[Schema, str, Dict]) -> StructType:
     """
@@ -21,9 +21,9 @@ def avro_to_pyspark_schema(avro_schema: Union[Schema, str, Dict]) -> StructType:
     
     def _convert_field(field: Field) -> StructField:
         """Convert a single Avro field to a PySpark StructField."""
-        field_type = field.type  # Use dot notation instead of subscript
-        nullable = field.has_default  # Avro fields with defaults are typically nullable
-        
+        field_type = field.type
+        nullable = field.has_default or any(isinstance(s, PrimitiveSchema) and s.type == 'null' for s in (field_type.schemas if isinstance(field_type, UnionSchema) else []))
+
         # Handle different schema types
         if isinstance(field_type, RecordSchema):
             return StructField(field.name, _convert_record(field_type), nullable)
@@ -41,7 +41,7 @@ def avro_to_pyspark_schema(avro_schema: Union[Schema, str, Dict]) -> StructType:
     
     def _convert_type(schema: Schema) -> Union[StructType, ArrayType, MapType, StringType, IntegerType, 
                                              LongType, DoubleType, FloatType, BooleanType, 
-                                             TimestampType, DateType, BinaryType]:
+                                             TimestampType, DateType, BinaryType, DecimalType]:
         """Convert an Avro schema type to a PySpark type."""
         if isinstance(schema, RecordSchema):
             return _convert_record(schema)
@@ -62,6 +62,11 @@ def avro_to_pyspark_schema(avro_schema: Union[Schema, str, Dict]) -> StructType:
                 'timestamp-millis': TimestampType(),
                 'timestamp-micros': TimestampType()
             }
+            # Handle decimal logical type for bytes
+            if schema.type == 'bytes' and hasattr(schema, 'props') and schema.props.get('logicalType') == 'decimal':
+                precision = schema.props.get('precision', 10)  # Default precision if not specified
+                scale = schema.props.get('scale', 0)  # Default scale if not specified
+                return DecimalType(precision=precision, scale=scale)
             return type_mapping.get(schema.type, StringType())  # Default to StringType for unknown types
         elif isinstance(schema, UnionSchema):
             non_null_types = [t for t in schema.schemas if t.type != 'null']
