@@ -5,7 +5,7 @@ from pyspark.sql.types import StructType, StructField, ArrayType, MapType, Strin
 
 def avro_to_pyspark_schema(avro_schema: Union[Schema, str, Dict]) -> StructType:
     """
-    Convert an Avro schema to a PySpark schema.
+    Convert an Avro schema to a PySpark schema, handling logical types.
     
     Args:
         avro_schema: Avro schema (can be RecordSchema object, JSON string, or dict)
@@ -42,7 +42,7 @@ def avro_to_pyspark_schema(avro_schema: Union[Schema, str, Dict]) -> StructType:
     def _convert_type(schema: Schema) -> Union[StructType, ArrayType, MapType, StringType, IntegerType, 
                                              LongType, DoubleType, FloatType, BooleanType, 
                                              TimestampType, DateType, BinaryType, DecimalType]:
-        """Convert an Avro schema type to a PySpark type."""
+        """Convert an Avro schema type to a PySpark type, including logical types."""
         if isinstance(schema, RecordSchema):
             return _convert_record(schema)
         elif isinstance(schema, ArraySchema):
@@ -50,6 +50,7 @@ def avro_to_pyspark_schema(avro_schema: Union[Schema, str, Dict]) -> StructType:
         elif isinstance(schema, MapSchema):
             return MapType(StringType(), _convert_type(schema.values))
         elif isinstance(schema, PrimitiveSchema):
+            # Base primitive type mapping
             type_mapping = {
                 'string': StringType(),
                 'int': IntegerType(),
@@ -58,15 +59,23 @@ def avro_to_pyspark_schema(avro_schema: Union[Schema, str, Dict]) -> StructType:
                 'float': FloatType(),
                 'boolean': BooleanType(),
                 'bytes': BinaryType(),
-                'date': DateType(),
-                'timestamp-millis': TimestampType(),
-                'timestamp-micros': TimestampType()
+                'null': StringType()  # Fallback for null
             }
-            # Handle decimal logical type for bytes
-            if schema.type == 'bytes' and hasattr(schema, 'props') and schema.props.get('logicalType') == 'decimal':
-                precision = schema.props.get('precision', 10)  # Default precision if not specified
-                scale = schema.props.get('scale', 0)  # Default scale if not specified
-                return DecimalType(precision=precision, scale=scale)
+            # Handle logical types
+            if hasattr(schema, 'props') and 'logicalType' in schema.props:
+                logical_type = schema.props.get('logicalType')
+                if logical_type == 'decimal' and schema.type == 'bytes':
+                    precision = schema.props.get('precision', 10)  # Default precision
+                    scale = schema.props.get('scale', 0)  # Default scale
+                    return DecimalType(precision=precision, scale=scale)
+                elif logical_type == 'date' and schema.type == 'int':
+                    return DateType()
+                elif logical_type == 'time-millis' and schema.type == 'int':
+                    return IntegerType()  # PySpark doesn't have a direct TimeType
+                elif logical_type in ('timestamp-millis', 'timestamp-micros') and schema.type == 'long':
+                    return TimestampType()
+                # Fallback for unhandled logical types
+                return type_mapping.get(schema.type, StringType())
             return type_mapping.get(schema.type, StringType())  # Default to StringType for unknown types
         elif isinstance(schema, UnionSchema):
             non_null_types = [t for t in schema.schemas if t.type != 'null']
