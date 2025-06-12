@@ -1,35 +1,39 @@
 from typing import Union
-from iceberg.schema import Schema as IcebergSchema
-from iceberg.types import (
+from pyiceberg.schema import Schema as IcebergSchema
+from pyiceberg.types import (
     StructType as IcebergStructType, ListType as IcebergListType, MapType as IcebergMapType,
-    PrimitiveType, IntegerType as IcebergIntegerType, LongType as IcebergLongType,
-    FloatType as IcebergFloatType, DoubleType as IcebergDoubleType, StringType as IcebergStringType,
-    BooleanType as IcebergBooleanType, BinaryType as IcebergBinaryType, TimestampType as IcebergTimestampType,
-    DateType as IcebergDateType, DecimalType as IcebergDecimalType, UUIDType as IcebergUUIDType
+    NestedField, IntegerType, LongType, FloatType, DoubleType, StringType, BooleanType,
+    BinaryType, TimestampType, TimestamptzType, DateType, DecimalType, UUIDType
 )
 from pyspark.sql.types import (
-    StructType, StructField, ArrayType, MapType, IntegerType, LongType, FloatType, DoubleType,
-    StringType, BooleanType, BinaryType, TimestampType, DateType, DecimalType
+    StructType, StructField, ArrayType, MapType, IntegerType as SparkIntegerType,
+    LongType as SparkLongType, FloatType as SparkFloatType, DoubleType as SparkDoubleType,
+    StringType as SparkStringType, BooleanType as SparkBooleanType, BinaryType as SparkBinaryType,
+    TimestampType as SparkTimestampType, DateType as SparkDateType, DecimalType as SparkDecimalType
 )
 
 def iceberg_to_pyspark_schema(iceberg_schema: Union[IcebergSchema, IcebergStructType]) -> StructType:
     """
-    Convert an Apache Iceberg schema to a PySpark schema.
+    Convert a pyiceberg schema to a PySpark schema.
     
     Args:
-        iceberg_schema: Iceberg schema (Schema or StructType object)
+        iceberg_schema: Iceberg schema (pyiceberg Schema or StructType object)
         
     Returns:
         StructType: Equivalent PySpark schema
     """
-    def _convert_type(iceberg_type: IcebergStructType) -> Union[StructType, ArrayType, MapType, IntegerType, 
-                                                              LongType, FloatType, DoubleType, StringType, 
-                                                              BooleanType, BinaryType, TimestampType, 
-                                                              DateType, DecimalType]:
-        """Convert an Iceberg type to a PySpark type."""
+    def _convert_type(iceberg_type: Union[IcebergStructType, IcebergListType, IcebergMapType, 
+                                         IntegerType, LongType, FloatType, DoubleType, StringType, 
+                                         BooleanType, BinaryType, TimestampType, TimestamptzType, 
+                                         DateType, DecimalType, UUIDType]) -> Union[
+                                             StructType, ArrayType, MapType, SparkIntegerType, 
+                                             SparkLongType, SparkFloatType, SparkDoubleType, 
+                                             SparkStringType, SparkBooleanType, SparkBinaryType, 
+                                             SparkTimestampType, SparkDateType, SparkDecimalType]:
+        """Convert a pyiceberg type to a PySpark type."""
         if isinstance(iceberg_type, IcebergStructType):
             fields = [
-                StructField(field.name, _convert_type(field.type), not field.required)
+                StructField(field.name, _convert_type(field.field_type), not field.required)
                 for field in iceberg_type.fields
             ]
             return StructType(fields)
@@ -40,24 +44,27 @@ def iceberg_to_pyspark_schema(iceberg_schema: Union[IcebergSchema, IcebergStruct
             key_type = _convert_type(iceberg_type.key_type)
             value_type = _convert_type(iceberg_type.value_type)
             return MapType(key_type, value_type, not iceberg_type.value_required)
-        elif isinstance(iceberg_type, PrimitiveType):
+        elif isinstance(iceberg_type, (IntegerType, LongType, FloatType, DoubleType, StringType,
+                                      BooleanType, BinaryType, TimestampType, TimestamptzType,
+                                      DateType, UUIDType)):
             type_mapping = {
-                IcebergIntegerType: IntegerType(),
-                IcebergLongType: LongType(),
-                IcebergFloatType: FloatType(),
-                IcebergDoubleType: DoubleType(),
-                IcebergStringType: StringType(),
-                IcebergBooleanType: BooleanType(),
-                IcebergBinaryType: BinaryType(),
-                IcebergTimestampType: TimestampType(),
-                IcebergDateType: DateType(),
-                IcebergUUIDType: StringType()  # UUID maps to StringType in PySpark
+                IntegerType: SparkIntegerType(),
+                LongType: SparkLongType(),
+                FloatType: SparkFloatType(),
+                DoubleType: SparkDoubleType(),
+                StringType: SparkStringType(),
+                BooleanType: SparkBooleanType(),
+                BinaryType: SparkBinaryType(),
+                TimestampType: SparkTimestampType(),
+                TimestamptzType: SparkTimestampType(),
+                DateType: SparkDateType(),
+                UUIDType: SparkStringType(),
             }
-            if isinstance(iceberg_type, IcebergDecimalType):
-                return DecimalType(precision=iceberg_type.precision, scale=iceberg_type.scale)
-            return type_mapping.get(type(iceberg_type), StringType())  # Fallback to StringType
+            if isinstance(iceberg_type, DecimalType):
+                return SparkDecimalType(precision=iceberg_type.precision, scale=iceberg_type.scale)
+            return type_mapping.get(type(iceberg_type), SparkStringType())  # Fallback to StringType
         else:
-            return StringType()  # Fallback for unhandled types
+            return SparkStringType()  # Fallback for unhandled types
 
     # If input is an Iceberg Schema, get its StructType
     if isinstance(iceberg_schema, IcebergSchema):
