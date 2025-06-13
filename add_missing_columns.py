@@ -1,21 +1,22 @@
-from typing import Union
+from typing import Union, List
 from pyspark.sql import DataFrame
 from pyspark.sql.types import (
     StructType, StructField, ArrayType, MapType, StringType, IntegerType, LongType, FloatType,
     DoubleType, BooleanType, BinaryType, TimestampType, DateType, DecimalType
 )
-from pyspark.sql.functions import lit, struct, array, create_map
+from pyspark.sql.functions import lit, struct, array, create_map, col
 
 def add_missing_columns(df: DataFrame, target_schema: StructType) -> DataFrame:
     """
-    Compare the DataFrame schema with the target schema and add missing columns, including nested structures.
+    Compare the DataFrame schema with the target schema and add missing columns, including nested fields,
+    using df.withColumn.
     
     Args:
         df: Input PySpark DataFrame
         target_schema: Target PySpark schema (StructType)
         
     Returns:
-        DataFrame: DataFrame with missing columns added as nulls
+        DataFrame: DataFrame with missing columns and nested fields added as nulls
     """
     def _create_null_column(field: StructField):
         """Create a null column for a given field, handling nested types."""
@@ -25,82 +26,84 @@ def add_missing_columns(df: DataFrame, target_schema: StructType) -> DataFrame:
                 lit(None).cast(nested_field.dataType).alias(nested_field.name)
                 for nested_field in field.dataType.fields
             ]
-            return struct(*nested_fields).alias(field.name)
+            return struct(*nested_fields)
         elif isinstance(field.dataType, ArrayType):
-            # For arrays, create an empty array or null array
-            return array().cast(field.dataType).alias(field.name)
+            # For arrays, create a null array
+            return lit(None).cast(field.dataType)
         elif isinstance(field.dataType, MapType):
-            # For maps, create an empty map or null map
-            return create_map().cast(field.dataType).alias(field.name)
+            # For maps, create a null map
+            return lit(None).cast(field.dataType)
         else:
             # For primitive types, use lit(None) with the correct type
-            return lit(None).cast(field.dataType).alias(field.name)
+            return lit(None).cast(field.dataType)
 
-    def _compare_and_add_fields(current_fields: dict, target_fields: list, parent_path: str = "") -> list:
-        """
-        Compare current and target fields, adding missing ones.
+    def _update_struct_column(df: DataFrame, field_name: str, current_field: StructField, 
+                             target_field: StructField) -> DataFrame:
+        """Update an existing struct column to include missing nested fields."""
+        current_nested_fields = {f.name: f for f in current_field.dataType.fields}
+        target_nested_fields = target_field.dataType.fields
+        nested_columns = []
         
-        Args:
-            current_fields: Dict of current field names to StructField (for lookup)
-            target_fields: List of target StructField objects
-            parent_path: Path to the current field (for nested fields)
-        
-        Returns:
-            List of columns to select (existing or new null columns)
-        """
-        select_columns = []
-        
-        for target_field in target_fields:
-            field_name = target_field.name
-            full_path = f"{parent_path}.{field_name}" if parent_path else field_name
-            
-            if field_name not in current_fields:
-                # Field is missing, add it as a null column
-                select_columns.append(_create_null_column(target_field))
+        for nested_field in target_nested_fields:
+            if nested_field.name in current_nested_fields:
+                # Preserve existing nested field
+                nested_columns.append(col(f"{field_name}.{nested_field.name}").alias(nested_field.name))
             else:
-                # Field exists, check if it needs nested updates
-                current_field = current_fields[field_name]
-                if isinstance(target_field.dataType, StructType) and isinstance(current_field.dataType, StructType):
-                    # Handle nested structs
-                    nested_current_fields = {f.name: f for f in current_field.dataType.fields}
-                    nested_target_fields = target_field.dataType.fields
-                    nested_columns = _compare_and_add_fields(nested_current_fields, nested_target_fields, full_path)
-                    select_columns.append(struct(*nested_columns).alias(field_name))
-                elif isinstance(target_field.dataType, ArrayType) and isinstance(current_field.dataType, ArrayType):
-                    # Handle arrays with nested structs
-                    if isinstance(target_field.dataType.elementType, StructType) and isinstance(current_field.dataType.elementType, StructType):
-                        nested_current_fields = {f.name: f for f in current_field.dataType.elementType.fields}
-                        nested_target_fields = target_field.dataType.elementType.fields
-                        nested_columns = _compare_and_add_fields(nested_current_fields, nested_target_fields, f"{full_path}[]")
-                        select_columns.append(
-                            array(struct(*nested_columns)).cast(target_field.dataType).alias(field_name)
-                        )
-                    else:
-                        # Non-struct array, keep as is
-                        select_columns.append(field_name)
-                elif isinstance(target_field.dataType, MapType) and isinstance(current_field.dataType, MapType):
-                    # Handle maps with nested structs as values
-                    if isinstance(target_field.dataType.valueType, StructType) and isinstance(current_field.dataType.valueType, StructType):
-                        nested_current_fields = {f.name: f for f in current_field.dataType.valueType.fields}
-                        nested_target_fields = target_field.dataType.valueType.fields
-                        nested_columns = _compare_and_add_fields(nested_current_fields, nested_target_fields, f"{full_path}[]")
-                        select_columns.append(
-                            create_map(lit("key"), struct(*nested_columns)).cast(target_field.dataType).alias(field_name)
-                        )
-                    else:
-                        # Non-struct map, keep as is
-                        select_columns.append(field_name)
-                else:
-                    # Non-nested field or type mismatch, keep as is
-                    select_columns.append(field_name)
+                # Add missing nested field as null
+                nested_columns.append(lit(None).cast(nested_field.dataType).alias(nested_field.name))
         
-        return select_columns
+        # Create new struct column with all fields
+        return df.withColumn(field_name, struct(*nested_columns))
+
+    def _update_array_column(df: DataFrame, field_name: str, current_field: StructField, 
+                            target_field: StructField) -> DataFrame:
+        """Update an existing array column to include missing nested fields in its struct elements."""
+        if isinstance(target_field.dataType.elementType, StructType) and isinstance(current_field.dataType.elementType, StructType):
+            current_nested_fields = {f.name: f for f in current_field.dataType.elementType.fields}
+            target_nested_fields = target_field.dataType.elementType.fields
+            nested_columns = []
+            for nested_field in target_nested_fields:
+                if nested_field.name in current_nested_fields:
+                    nested_columns.append(col(f"{field_name}[*].{nested_field.name}").alias(nested_field.name))
+                else:
+                    nested_columns.append(lit(None).cast(nested_field.dataType).alias(nested_field.name))
+            # Transform array elements
+            return df.withColumn(field_name, col(field_name).cast(target_field.dataType))
+        else:
+            # Non-struct array, cast to target type
+            return df.withColumn(field_name, col(field_name).cast(target_field.dataType))
+
+    def _update_map_column(df: DataFrame, field_name: str, current_field: StructField, 
+                          target_field: StructField) -> DataFrame:
+        """Update an existing map column to include missing nested fields in its struct values."""
+        if isinstance(target_field.dataType.valueType, StructType) and isinstance(current_field.dataType.valueType, StructType):
+            current_nested_fields = {f.name: f for f in current_field.dataType.valueType.fields}
+            target_nested_fields = target_field.dataType.valueType.fields
+            # Cast to target type to add missing fields
+            return df.withColumn(field_name, col(field_name).cast(target_field.dataType))
+        else:
+            # Non-struct map, cast to target type
+            return df.withColumn(field_name, col(field_name).cast(target_field.dataType))
 
     # Get current DataFrame schema as a dictionary for lookup
     current_fields = {field.name: field for field in df.schema.fields}
     
-    # Compare and add missing fields
-    select_columns = _compare_and_add_fields(current_fields, target_schema.fields)
+    # Iterate through target schema fields
+    result_df = df
+    for target_field in target_schema.fields:
+        field_name = target_field.name
+        if field_name not in current_fields:
+            # Add missing top-level column
+            result_df = result_df.withColumn(field_name, _create_null_column(target_field))
+        else:
+            # Check for nested field updates
+            current_field = current_fields[field_name]
+            if isinstance(target_field.dataType, StructType) and isinstance(current_field.dataType, StructType):
+                result_df = _update_struct_column(result_df, field_name, current_field, target_field)
+            elif isinstance(target_field.dataType, ArrayType) and isinstance(current_field.dataType, ArrayType):
+                result_df = _update_array_column(result_df, field_name, current_field, target_field)
+            elif isinstance(target_field.dataType, MapType) and isinstance(current_field.dataType, MapType):
+                result_df = _update_map_column(result_df, field_name, current_field, target_field)
+            # Non-nested fields or type mismatches are preserved as-is
     
-    # Select columns to create the new DataFrame
-    return df.select(*select_columns)
+    return result_df
