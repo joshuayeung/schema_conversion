@@ -3,7 +3,7 @@ from pyspark.sql import SparkSession
 from pyspark.sql.types import (
     StructType, StructField, StringType, IntegerType, ArrayType, MapType, LongType, DecimalType
 )
-from pyspark.sql.functions import col, lit
+from pyspark.sql.functions import col
 from add_missing_columns import add_missing_columns
 from pyiceberg.schema import Schema as IcebergSchema
 from pyiceberg.types import (
@@ -22,6 +22,15 @@ def simple_df(spark):
     """Fixture for a simple DataFrame with name and age."""
     data = [("Alice", 30), ("Bob", 25)]
     return spark.createDataFrame(data, ["name", "age"])
+
+@pytest.fixture
+def nested_df(spark):
+    """Fixture for a DataFrame with a nested struct."""
+    data = [
+        ("Alice", {"street": "123 Main"}),
+        ("Bob", {"street": "456 Oak"})
+    ]
+    return spark.createDataFrame(data, ["name", "address"])
 
 @pytest.fixture
 def target_schema():
@@ -132,17 +141,8 @@ def test_no_missing_columns(spark):
     assert len(result_data) == 1
     assert result_data[0]["name"] == "Alice" and result_data[0]["age"] == 30
 
-def test_nested_struct_partial_match(spark):
-    """Test handling nested struct with partial field matches."""
-    data = [("Alice", {"street": "123 Main"})]
-    df_schema = StructType([
-        StructField("name", StringType(), True),
-        StructField("address", StructType([
-            StructField("street", StringType(), True)
-        ]), True)
-    ])
-    df = spark.createDataFrame(data, df_schema)
-    
+def test_nested_struct_partial_match(spark, nested_df):
+    """Test updating nested struct with missing field (city)."""
     target_schema = StructType([
         StructField("name", StringType(), True),
         StructField("address", StructType([
@@ -151,7 +151,7 @@ def test_nested_struct_partial_match(spark):
         ]), True)
     ])
     
-    result_df = add_missing_columns(df, target_schema)
+    result_df = add_missing_columns(nested_df, target_schema)
     
     # Verify schema
     assert result_df.schema == target_schema
@@ -161,6 +161,9 @@ def test_nested_struct_partial_match(spark):
     assert result_data[0]["name"] == "Alice"
     assert result_data[0]["address.street"] == "123 Main"
     assert result_data[0]["address.city"] is None
+    assert result_data[1]["name"] == "Bob"
+    assert result_data[1]["address.street"] == "456 Oak"
+    assert result_data[1]["address.city"] is None
 
 def test_empty_dataframe(spark, target_schema):
     """Test handling an empty DataFrame."""
@@ -177,7 +180,7 @@ def test_empty_dataframe(spark, target_schema):
     assert result_df.count() == 0
 
 def test_array_with_nested_struct(spark):
-    """Test handling arrays with nested structs."""
+    """Test updating array with nested structs."""
     data = [("Alice", [{"value": 1}])]
     df_schema = StructType([
         StructField("name", StringType(), True),
@@ -206,4 +209,34 @@ def test_array_with_nested_struct(spark):
     assert len(result_data[0]["attributes"]) == 1
     assert result_data[0]["attributes"][0]["value"] == 1
     assert result_data[0]["attributes"][0]["category"] is None
+
+def test_map_with_nested_struct(spark):
+    """Test updating map with nested structs."""
+    data = [("Alice", {"key1": {"value": 1}})]
+    df_schema = StructType([
+        StructField("name", StringType(), True),
+        StructField("attributes", MapType(StringType(), StructType([
+            StructField("value", IntegerType(), True)
+        ])), True)
+    ])
+    df = spark.createDataFrame(data, df_schema)
+    
+    target_schema = StructType([
+        StructField("name", StringType(), True),
+        StructField("attributes", MapType(StringType(), StructType([
+            StructField("value", IntegerType(), True),
+            StructField("category", StringType(), True)
+        ])), True)
+    ])
+    
+    result_df = add_missing_columns(df, target_schema)
+    
+    # Verify schema
+    assert result_df.schema == target_schema
+    
+    # Verify data
+    result_data = result_df.select("name", "attributes").collect()
+    assert result_data[0]["name"] == "Alice"
+    assert result_data[0]["attributes"]["key1"]["value"] == 1
+    assert result_data[0]["attributes"]["key1"]["category"] is None
     
