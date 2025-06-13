@@ -21,7 +21,7 @@ def normalize_schema(schema: DataType) -> DataType:
             StructField(
                 field.name,
                 normalize_schema(field.dataType),
-                nullable=True,  # Normalize to nullable=True to avoid mismatches
+                nullable=True,  # Normalize to nullable=True
                 metadata={}
             ) for field in schema.fields
         ])
@@ -111,7 +111,7 @@ def add_missing_columns(df: DataFrame, target_schema: StructType) -> DataFrame:
                 else:
                     nested_columns.append(f"CAST(NULL AS {nested_field.dataType.simpleString()}) AS {nested_field_name}")
             
-            # Transform array elements using expr to avoid cast issues
+            # Transform array elements using expr
             transform_expr = f"""
                 TRANSFORM({field_name}, x -> STRUCT({', '.join(nested_columns)}))
             """
@@ -122,7 +122,7 @@ def add_missing_columns(df: DataFrame, target_schema: StructType) -> DataFrame:
 
     def _update_map_column(df: DataFrame, field_name: str, current_field: StructField, 
                           target_field: StructField) -> DataFrame:
-        """Update an existing map column to include missing nested fields in its struct values."""
+        """Update an existing map column to include missing nested fields or align schema."""
         if schemas_are_equal(current_field.dataType, target_field.dataType):
             return df  # No update needed if schemas are equal
         
@@ -137,7 +137,7 @@ def add_missing_columns(df: DataFrame, target_schema: StructType) -> DataFrame:
                 else:
                     nested_columns.append(f"CAST(NULL AS {nested_field.dataType.simpleString()}) AS {nested_field_name}")
             
-            # Transform map values using expr to avoid cast issues
+            # Transform map values using expr
             transform_expr = f"""
                 MAP_FROM_ENTRIES(
                     TRANSFORM(MAP_ENTRIES({field_name}), x -> 
@@ -147,8 +147,8 @@ def add_missing_columns(df: DataFrame, target_schema: StructType) -> DataFrame:
             """
             return df.withColumn(field_name, expr(transform_expr).cast(target_field.dataType))
         else:
-            # Non-struct map, cast to target type
-            return df.withColumn(field_name, col(field_name).cast(target_field.dataType))
+            # Simple map (e.g., MAP<STRING, STRING>), create new map with same entries
+            return df.withColumn(field_name, col(field_name))  # Avoid cast, just reselect
 
     # Get current DataFrame schema as a dictionary for lookup
     current_fields = {field.name: field for field in df.schema.fields}
