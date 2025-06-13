@@ -3,7 +3,7 @@ from pyiceberg.schema import Schema as IcebergSchema
 from pyiceberg.types import (
     StructType as IcebergStructType, ListType as IcebergListType, MapType as IcebergMapType,
     NestedField, IntegerType, LongType, FloatType, DoubleType, StringType, BooleanType,
-    BinaryType, TimestampType, TimestamptzType, DateType, DecimalType, UUIDType
+    BinaryType, TimestampType, TimestamptzType, DateType, DecimalType, UUIDType, TimeType
 )
 from pyspark.sql.types import (
     StructType, StructField, ArrayType, MapType, IntegerType as SparkIntegerType,
@@ -25,7 +25,7 @@ def iceberg_to_pyspark_schema(iceberg_schema: Union[IcebergSchema, IcebergStruct
     def _convert_type(iceberg_type: Union[IcebergStructType, IcebergListType, IcebergMapType, 
                                          IntegerType, LongType, FloatType, DoubleType, StringType, 
                                          BooleanType, BinaryType, TimestampType, TimestamptzType, 
-                                         DateType, DecimalType, UUIDType]) -> Union[
+                                         DateType, DecimalType, UUIDType, TimeType]) -> Union[
                                              StructType, ArrayType, MapType, SparkIntegerType, 
                                              SparkLongType, SparkFloatType, SparkDoubleType, 
                                              SparkStringType, SparkBooleanType, SparkBinaryType, 
@@ -46,11 +46,12 @@ def iceberg_to_pyspark_schema(iceberg_schema: Union[IcebergSchema, IcebergStruct
             return MapType(key_type, value_type, not iceberg_type.value_required)
         elif isinstance(iceberg_type, (IntegerType, LongType, FloatType, DoubleType, StringType,
                                       BooleanType, BinaryType, TimestampType, TimestamptzType,
-                                      DateType, UUIDType)):
+                                      DateType, TimeType, UUIDType)):
             type_mapping = {
                 IntegerType: SparkIntegerType(),
                 LongType: SparkLongType(),
                 FloatType: SparkFloatType(),
+                DecimalType: SparkDecimalType,
                 DoubleType: SparkDoubleType(),
                 StringType: SparkStringType(),
                 BooleanType: SparkBooleanType(),
@@ -58,6 +59,7 @@ def iceberg_to_pyspark_schema(iceberg_schema: Union[IcebergSchema, IcebergStruct
                 TimestampType: SparkTimestampType(),
                 TimestamptzType: SparkTimestampType(),
                 DateType: SparkDateType(),
+                TimeType: SparkLongType(),  # TimeType maps to LongType (microseconds since midnight)
                 UUIDType: SparkStringType(),
             }
             if isinstance(iceberg_type, DecimalType):
