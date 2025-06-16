@@ -132,11 +132,11 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
         elif isinstance(field_type, ArrayType):
             # For arrays, process each element recursively
             if field.nullable and isinstance(field_type.elementType, StructType):
-                # Create a temporary column name for the array elements
-                element_alias = f"{field_name}_element"
+                # Use a generic name for the element to avoid conflicts
                 element_condition = build_null_condition(
-                    StructField(element_alias, field_type.elementType, True)
-                ).alias(element_alias)
+                    StructField("_element", field_type.elementType, True),
+                    prefix=f"{field_name}."
+                )
                 return when(
                     col(field_name).isNull(),
                     lit(None)
@@ -146,13 +146,12 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
             return col(field_name)
             
         elif isinstance(field_type, MapType):
-            # For maps, process values recursively
             if field.nullable and isinstance(field_type.valueType, StructType):
-                # Create a temporary column name for map values
-                value_alias = f"{field_name}_value"
+                # Use a generic name for the value to avoid conflicts
                 value_condition = build_null_condition(
-                    StructField(value_alias, field_type.valueType, True)
-                ).alias(value_alias)
+                    StructField("_value", field_type.valueType, True),
+                    prefix=f"{field_name}."
+                )
                 return when(
                     col(field_name).isNull(),
                     lit(None)
