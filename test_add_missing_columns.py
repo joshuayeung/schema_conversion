@@ -239,4 +239,21 @@ def test_map_with_nested_struct(spark):
     assert result_data[0]["name"] == "Alice"
     assert result_data[0]["attributes"]["key1"]["value"] == 1
     assert result_data[0]["attributes"]["key1"]["category"] is None
+
+def test_missing_struct_column_null(spark, simple_df, target_schema):
+    """Test that a missing StructType column is set to NULL."""
+    from iceberg_to_pyspark_schema import iceberg_to_pyspark_schema
+    target_spark_schema = iceberg_to_pyspark_schema(target_schema)
     
+    result_df = add_missing_columns(simple_df, target_spark_schema)
+    
+    # Verify info struct is NULL
+    info_field = next(f for f in result_df.schema.fields if f.name == "info")
+    assert isinstance(info_field.dataType, StructType)
+    assert len(info_field.dataType.fields) == 2
+    assert info_field.dataType.fields[0].name == "id" and isinstance(info_field.dataType.fields[0].dataType, IntegerType)
+    assert info_field.dataType.fields[1].name == "category" and isinstance(info_field.dataType.fields[1].dataType, StringType)
+    
+    # Verify info is NULL
+    result_data = result_df.select("info").collect()
+    assert all(row["info"] is None for row in result_data)
