@@ -53,20 +53,19 @@ def schemas_are_equal(schema1: DataType, schema2: DataType) -> bool:
 def add_missing_columns(df: DataFrame, target_schema: StructType) -> DataFrame:
     """
     Compare the DataFrame schema with the target schema and add missing columns, including nested fields,
-    using df.withColumn. Missing complex columns are set to NULL.
+    using df.withColumn. Missing complex columns are set to NULL or constructed from flattened fields.
     
     Args:
         df: Input PySpark DataFrame
         target_schema: Target PySpark schema (StructType)
         
     Returns:
-        DataFrame: DataFrame with missing columns and nested fields added as NULL
+        DataFrame: DataFrame with missing columns and nested fields added correctly
     """
     def _create_null_column(field: StructField):
         """Create a NULL column for a given field, ensuring StructType is not flattened."""
         logger.info(f"Creating NULL column for field: {field.name} with type {field.dataType.simpleString()}")
         if isinstance(field.dataType, StructType):
-            # Explicitly create a NULL struct to prevent flattening
             return lit(None).cast(field.dataType)
         return lit(None).cast(field.dataType)
 
@@ -225,39 +224,62 @@ def add_missing_columns(df: DataFrame, target_schema: StructType) -> DataFrame:
     # Log input DataFrame schema
     logger.info(f"Input DataFrame schema: {df.schema.simpleString()}")
 
-    # Check for existing columns that might conflict
+    # Detect and consolidate flattened columns for StructType fields
     current_columns = [field.name for field in df.schema.fields]
-    for target_field in target_schema.fields:
-        if isinstance(target_field.dataType, StructType):
-            for nested_field in target_field.dataType.fields:
-                conflicting_name = f"{target_field.name}.{nested_field.name}"
-                if conflicting_name in current_columns:
-                    logger.warning(f"Potential conflict: Column {conflicting_name} exists in DataFrame and may interfere with {target_field.name}")
-
-    # Get current DataFrame schema as a dictionary for lookup
-    current_fields = {field.name: field for field in df.schema.fields}
-    
-    # Iterate through target schema fields
     result_df = df
+    columns_to_drop = []
     for target_field in target_schema.fields:
         field_name = target_field.name
-        if field_name not in current_fields:
-            # Add missing top-level column as NULL
+        if isinstance(target_field.dataType, StructType):
+            # Check for flattened columns (e.g., lastAction.authorization)
+            flattened_columns = {}
+            for col_name in current_columns:
+                if col_name.startswith(f"{field_name}."):
+                    nested_field_name = col_name[len(field_name) + 1:]
+                    flattened_columns[nested_field_name] = col_name
+            
+            if flattened_columns:
+                logger.info(f"Flattened columns detected for {field_name}: {list(flattened_columns.values())}")
+                # Construct the StructType column
+                nested_columns = []
+                for nested_field in target_field.dataType.fields:
+                    nested_field_name = nested_field.name
+                    if nested_field_name in flattened_columns:
+                        # Use existing flattened column
+                        col_name = flattened_columns[nested_field_name]
+                        nested_columns.append(col(col_name).cast(nested_field.dataType).alias(nested_field_name))
+                        columns_to_drop.append(col_name)
+                    else:
+                        # Add missing field as NULL
+                        nested_columns.append(lit(None).cast(nested_field.dataType).alias(nested_field_name))
+                
+                # Add the StructType column
+                logger.info(f"Creating StructType column {field_name} from flattened columns")
+                result_df = result_df.withColumn(field_name, struct(*nested_columns))
+                logger.info(f"Schema after adding {field_name}: {result_df.schema.simpleString()}")
+                continue  # Skip further processing for this field
+        
+        # Handle non-StructType fields or StructType fields without flattened columns
+        if field_name not in [f.name for f in result_df.schema.fields]:
             logger.info(f"Adding missing column: {field_name}")
             result_df = result_df.withColumn(field_name, _create_null_column(target_field))
-            # Log schema after adding column
             logger.info(f"Schema after adding {field_name}: {result_df.schema.simpleString()}")
         else:
             # Check for nested field updates
-            current_field = current_fields[field_name]
+            current_field = next(f for f in result_df.schema.fields if f.name == field_name)
             if isinstance(target_field.dataType, StructType) and isinstance(current_field.dataType, StructType):
                 result_df = _update_struct_column(result_df, field_name, current_field, target_field)
             elif isinstance(target_field.dataType, ArrayType) and isinstance(current_field.dataType, ArrayType):
                 result_df = _update_array_column(result_df, field_name, current_field, target_field)
             elif isinstance(target_field.dataType, MapType) and isinstance(current_field.dataType, MapType):
                 result_df = _update_map_column(result_df, field_name, current_field, target_field)
-            # Non-nested fields or type mismatches are preserved as-is
     
+    # Drop flattened columns
+    if columns_to_drop:
+        logger.info(f"Dropping flattened columns: {columns_to_drop}")
+        result_df = result_df.drop(*columns_to_drop)
+        logger.info(f"Schema after dropping flattened columns: {result_df.schema.simpleString()}")
+
     # Final schema validation
     final_columns = [field.name for field in result_df.schema.fields]
     for target_field in target_schema.fields:
