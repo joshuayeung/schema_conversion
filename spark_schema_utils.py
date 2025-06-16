@@ -75,22 +75,21 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
                 for cond in conditions[1:]:
                     combined_condition = combined_condition & cond
                 
-                # Recursively process subfields
+                # Process subfields without including parent prefix in their names
                 subfields = [
-                    build_null_condition(subfield, f"{field_name}.")
+                    build_null_condition(subfield, f"{field_name}.").alias(subfield.name)
                     for subfield in field_type.fields
                 ]
                 return when(
                     combined_condition,
                     lit(None)
                 ).otherwise(
-                    struct(*[col(f"{field_name}.{subfield.name}").alias(subfield.name)
-                            for subfield in field_type.fields])
+                    struct(*subfields)
                 ).alias(field_name)
             else:
                 # If struct is not nullable, just process subfields
                 subfields = [
-                    build_null_condition(subfield, f"{field_name}.")
+                    build_null_condition(subfield, f"{field_name}.").alias(subfield.name)
                     for subfield in field_type.fields
                 ]
                 return struct(*subfields).alias(field_name)
@@ -102,12 +101,12 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
                 element_alias = f"{field_name}_element"
                 element_condition = build_null_condition(
                     StructField(element_alias, field_type.elementType, True)
-                )
+                ).alias(element_alias)
                 return when(
                     col(field_name).isNull(),
                     lit(None)
                 ).otherwise(
-                    array(*[element_condition]).cast(field_type)
+                    array(element_condition).cast(field_type)
                 ).alias(field_name)
             return col(field_name)
             
@@ -118,7 +117,7 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
                 value_alias = f"{field_name}_value"
                 value_condition = build_null_condition(
                     StructField(value_alias, field_type.valueType, True)
-                )
+                ).alias(value_alias)
                 return when(
                     col(field_name).isNull(),
                     lit(None)
