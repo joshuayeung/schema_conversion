@@ -50,14 +50,24 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
                 
         elif isinstance(field_type, ArrayType):
             if existing_field and isinstance(existing_field.dataType, ArrayType):
-                # Preserve existing array if it exists
+                if isinstance(field_type.elementType, StructType) or isinstance(field_type.elementType, ArrayType):
+                    element_expr = get_field_expr(
+                        StructField(field.name, field_type.elementType, True),
+                        prefix="",
+                        existing_field=existing_field.dataType if existing_field else None
+                    )
+                    return when(
+                        col(field_name).isNotNull(),
+                        transform(col(field_name), lambda x: element_expr)
+                    ).otherwise(
+                        array().cast(field_type)
+                    ).alias(field_name)
                 return col(field_name)
             # Create an empty array of the correct type
             return array().cast(field_type).alias(field_name)
             
         elif isinstance(field_type, MapType):
-            if existing_field and isinstance(field_type, MapType):
-                # Preserve existing map if it exists
+            if existing_field and isinstance(existing_field.dataType, MapType):
                 return col(field_name)
             # Create an empty map of the correct type
             return map_from_arrays(array(), array()).cast(field_type).alias(field_name)
@@ -101,11 +111,11 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
             # For structs, check if all required fields are NULL
             required_fields = [f for f in field_type.fields if not f.nullable]
             if not required_fields:
-                return col(field_name)
+                return col(field_name) if not is_array_element else col("x")
             
             # If the struct is nullable, check if all required fields are NULL
             if field.nullable:
-                conditions = [col(f"{field_name}.{f.name}").isNull() for f in required_fields]
+                conditions = [col(f"{field_name}.{f.name}").isNull() for f in required_fields] if not is_array_element else [col(f"x.{f.name}").isNull() for f in required_fields]
                 combined_condition = conditions[0]
                 for cond in conditions[1:]:
                     combined_condition = combined_condition & cond
@@ -113,6 +123,8 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
                 # Process subfields without including parent prefix in their names
                 subfields = [
                     build_null_condition(subfield, f"{field_name}.", is_array_element=is_array_element).alias(subfield.name)
+                    if not is_array_element
+                    else build_null_condition(subfield, "", is_array_element=True).alias(subfield.name)
                     for subfield in field_type.fields
                 ]
                 return when(
@@ -120,21 +132,41 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
                     lit(None)
                 ).otherwise(
                     struct(*subfields)
-                ).alias(field_name)
+                ).alias(field_name) if not is_array_element else when(
+                    combined_condition,
+                    lit(None)
+                ).otherwise(
+                    struct(*subfields)
+                )
             else:
                 # If struct is not nullable, just process subfields
                 subfields = [
                     build_null_condition(subfield, f"{field_name}.", is_array_element=is_array_element).alias(subfield.name)
+                    if not is_array_element
+                    else build_null_condition(subfield, "", is_array_element=True).alias(subfield.name)
                     for subfield in field_type.fields
                 ]
-                return struct(*subfields).alias(field_name)
+                return struct(*subfields).alias(field_name) if not is_array_element else struct(*subfields)
                 
         elif isinstance(field_type, ArrayType):
             # For arrays, process each element recursively
             if field.nullable and isinstance(field_type.elementType, StructType):
-                # Process each array element using transform
+                # Process struct elements using transform
                 element_condition = build_null_condition(
-                    StructField(field.name, field_type.elementType, True),
+                    StructField("element", field_type.elementType, True),
+                    prefix="",
+                    is_array_element=True
+                )
+                return when(
+                    col(field_name).isNull(),
+                    lit(None)
+                ).otherwise(
+                    transform(col(field_name), lambda x: element_condition).cast(field_type)
+                ).alias(field_name)
+            elif field.nullable and isinstance(field_type.elementType, ArrayType):
+                # Process nested arrays
+                element_condition = build_null_condition(
+                    StructField("element", field_type.elementType, True),
                     prefix="",
                     is_array_element=True
                 )
@@ -147,11 +179,9 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
             return col(field_name)
             
         elif isinstance(field_type, MapType):
-            # For maps, process values recursively
             if field.nullable and isinstance(field_type.valueType, StructType):
-                # Process map values using transform
                 value_condition = build_null_condition(
-                    StructField(field.name, field_type.valueType, True),
+                    StructField("value", field_type.valueType, True),
                     prefix="",
                     is_array_element=True
                 )
