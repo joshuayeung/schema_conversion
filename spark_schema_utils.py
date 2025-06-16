@@ -1,6 +1,6 @@
 from pyspark.sql import DataFrame
 from pyspark.sql.types import StructType, StructField, ArrayType, MapType, NullType
-from pyspark.sql.functions import lit, col, when, array, struct, map_from_arrays, coalesce, expr
+from pyspark.sql.functions import lit, col, when, array, struct, map_from_arrays, coalesce, expr, size
 
 def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
     """
@@ -48,11 +48,39 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
                 
         elif isinstance(field_type, ArrayType):
             if isinstance(existing_field, StructField) and isinstance(existing_field.dataType, ArrayType):
+                if isinstance(field_type.elementType, StructType):
+                    element_field = StructField("element", field_type.elementType, True)
+                    existing_element_field = StructField("element", existing_field.dataType.elementType, True) if isinstance(existing_field.dataType.elementType, StructType) else None
+                    element_expr = get_field_expr(element_field, "element", existing_element_field)
+                    return when(
+                        col(field_name).isNotNull(),
+                        expr(f"""
+                            (SELECT ARRAY_AGG({element_expr})
+                             FROM (SELECT EXPLODE(COALESCE({field_name}, ARRAY())) AS element))
+                        """)
+                    ).otherwise(
+                        array().cast(field_type)
+                    ).alias(field_name)
                 return col(field_name).alias(field_name)
             return array().cast(field_type).alias(field_name)
             
         elif isinstance(field_type, MapType):
             if isinstance(existing_field, StructField) and isinstance(existing_field.dataType, MapType):
+                if isinstance(field_type.valueType, StructType):
+                    value_field = StructField("value", field_type.valueType, True)
+                    existing_value_field = StructField("value", existing_field.dataType.valueType, True) if isinstance(existing_field.dataType.valueType, StructType) else None
+                    value_expr = get_field_expr(value_field, "value", existing_value_field)
+                    return when(
+                        col(field_name).isNotNull(),
+                        expr(f"""
+                            TRANSFORM_VALUES(
+                                COALESCE({field_name}, MAP()),
+                                (k, v) -> (SELECT {value_expr} FROM (SELECT v AS value))
+                            )
+                        """)
+                    ).otherwise(
+                        map_from_arrays(array(), array()).cast(field_type)
+                    ).alias(field_name)
                 return col(field_name).alias(field_name)
             return map_from_arrays(array(), array()).cast(field_type).alias(field_name)
             
