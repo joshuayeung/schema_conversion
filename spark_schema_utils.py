@@ -1,6 +1,6 @@
 from pyspark.sql import DataFrame
 from pyspark.sql.types import StructType, StructField, ArrayType, MapType, NullType
-from pyspark.sql.functions import lit, col, array, struct, map_from_arrays
+from pyspark.sql.functions import lit, col, when, array, struct, map_from_arrays, coalesce, expr
 
 def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
     """
@@ -27,9 +27,7 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
             for subfield in field_type.fields:
                 existing_subfield = existing_subfields.get(subfield.name)
                 if existing_subfield and isinstance(existing_field, StructField):
-                    # Use existing subfield if available
                     subfield_expr = col(f"{field_name}.{subfield.name}")
-                    # Recursively ensure nested subfields are added
                     if isinstance(subfield.dataType, (StructType, ArrayType, MapType)):
                         nested_expr = get_field_expr(
                             subfield,
@@ -38,7 +36,6 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
                         )
                         subfield_expr = nested_expr
                 else:
-                    # Generate NULL expression for missing subfield
                     subfield_expr = get_field_expr(
                         subfield,
                         f"{field_name}." if field_name else "",
@@ -86,84 +83,74 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
     Returns:
         DataFrame with normalized NULL values for nested structures
     """
-    def build_null_condition(field: StructField, prefix: str = "", is_array_element: bool = False, lambda_var: str = None) -> str:
+    def build_null_condition(field: StructField, prefix: str = "", existing_field: StructField = None) -> str:
         """Build condition to check if a field should be set to NULL."""
         field_type = field.dataType
-        field_name = f"{prefix}{field.name}" if prefix and not is_array_element else field.name
+        field_name = f"{prefix}{field.name}" if prefix else field.name
         
         if isinstance(field_type, StructType):
+            existing_struct_type = existing_field.dataType if isinstance(existing_field, StructField) and isinstance(existing_field.dataType, StructType) else None
+            existing_subfields = {f.name: f for f in existing_struct_type.fields} if existing_struct_type else {}
+            
             required_fields = [f for f in field_type.fields if not f.nullable]
             if not required_fields:
-                return col(field_name) if not is_array_element else col(lambda_var)
+                return col(field_name).alias(field_name)
             
-            subfields = [
-                build_null_condition(
+            subfield_exprs = []
+            conditions = []
+            for subfield in field_type.fields:
+                existing_subfield = existing_subfields.get(subfield.name)
+                subfield_expr = build_null_condition(
                     subfield,
-                    f"{field_name}." if not is_array_element else "",
-                    is_array_element=is_array_element,
-                    lambda_var=f"{lambda_var}.{subfield.name}" if is_array_element and lambda_var else None
-                ).alias(subfield.name)
-                for subfield in field_type.fields
-            ]
+                    f"{field_name}." if field_name else "",
+                    existing_subfield
+                )
+                subfield_expr = subfield_expr.alias(subfield.name)
+                subfield_exprs.append(subfield_expr)
+                if not subfield.nullable:
+                    conditions.append(col(f"{field_name}.{subfield.name}").isNull())
+            
+            combined_condition = conditions[0] if conditions else lit(True)
+            for cond in conditions[1:]:
+                combined_condition = combined_condition & cond
             
             if field.nullable:
-                conditions = [
-                    col(f"{field_name}.{f.name}").isNull() if not is_array_element else col(f"{lambda_var}.{f.name}").isNull()
-                    for f in required_fields
-                ]
-                combined_condition = conditions[0]
-                for cond in conditions[1:]:
-                    combined_condition = combined_condition & cond
-                
                 return when(
                     combined_condition,
                     lit(None)
                 ).otherwise(
-                    struct(*subfields)
-                ).alias(field_name) if not is_array_element else when(
-                    combined_condition,
-                    lit(None)
-                ).otherwise(
-                    struct(*subfields)
-                )
-            else:
-                return struct(*subfields).alias(field_name) if not is_array_element else struct(*subfields)
+                    struct(*subfield_exprs)
+                ).alias(field_name)
+            return struct(*subfield_exprs).alias(field_name)
                 
         elif isinstance(field_type, ArrayType):
-            if field.nullable and isinstance(field_type.elementType, (StructType, ArrayType)):
-                element_condition = build_null_condition(
-                    StructField("element", field_type.elementType, True),
-                    prefix="",
-                    is_array_element=True,
-                    lambda_var="x"
-                )
+            if field.nullable:
                 return when(
-                    col(field_name).isNull(),
+                    col(field_name).isNull() | (size(col(field_name)) == 0),
                     lit(None)
                 ).otherwise(
-                    transform(col(field_name), lambda x: element_condition).cast(field_type)
+                    col(field_name)
                 ).alias(field_name)
-            return col(field_name)
+            return col(field_name).alias(field_name)
             
         elif isinstance(field_type, MapType):
-            if field.nullable and isinstance(field_type.valueType, StructType):
-                value_condition = build_null_condition(
-                    StructField("value", field_type.valueType, True),
-                    prefix="",
-                    is_array_element=True,
-                    lambda_var="v"
-                )
+            if field.nullable:
                 return when(
-                    col(field_name).isNull(),
+                    col(field_name).isNull() | (size(map_keys(col(field_name))) == 0),
                     lit(None)
                 ).otherwise(
-                    expr(f"transform_values({field_name}, (k, v) -> {value_condition})").cast(field_type)
+                    col(field_name)
                 ).alias(field_name)
-            return col(field_name)
+            return col(field_name).alias(field_name)
             
         else:
-            return col(field_name) if not is_array_element else col(lambda_var)
+            return col(field_name).alias(field_name)
     
-    select_expr = [build_null_condition(field) for field in schema.fields]
+    existing_columns = {f.name: f for f in df.schema.fields}
+    select_expr = []
+    
+    for field in schema.fields:
+        existing_field = existing_columns.get(field.name)
+        select_expr.append(build_null_condition(field, "", existing_field))
     
     return df.select(*select_expr)
