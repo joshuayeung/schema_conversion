@@ -4,7 +4,7 @@ from pyspark.sql.types import (
     StructType, StructField, ArrayType, MapType, StringType, IntegerType, LongType, FloatType,
     DoubleType, BooleanType, BinaryType, TimestampType, DateType, DecimalType, DataType
 )
-from pyspark.sql.functions import lit, struct, col, transform, expr
+from pyspark.sql.functions import lit, struct, col, transform, expr, when, array, size, map_values
 
 def normalize_schema(schema: DataType) -> DataType:
     """
@@ -21,7 +21,7 @@ def normalize_schema(schema: DataType) -> DataType:
             StructField(
                 field.name,
                 normalize_schema(field.dataType),
-                nullable=True,
+                nullable=field.nullable,
                 metadata={}
             ) for field in schema.fields
         ])
@@ -34,7 +34,7 @@ def normalize_schema(schema: DataType) -> DataType:
 
 def schemas_are_equal(schema1: DataType, schema2: DataType) -> bool:
     """
-    Compare two schemas for equality, ignoring metadata and normalizing nullability.
+    Compare two schemas for equality, ignoring metadata.
     
     Args:
         schema1: First PySpark DataType
@@ -48,7 +48,8 @@ def schemas_are_equal(schema1: DataType, schema2: DataType) -> bool:
 def add_missing_columns(df: DataFrame, target_schema: StructType) -> DataFrame:
     """
     Compare the DataFrame schema with the target schema and add missing columns, including nested fields,
-    using df.withColumn. Missing complex columns (StructType, ArrayType, MapType) are set to NULL.
+    using df.withColumn. Missing complex columns are set to NULL. For existing structs, maps, and arrays,
+    replace empty or all-null values with NULL and adjust field/element/value nullability.
     
     Args:
         df: Input PySpark DataFrame
@@ -63,25 +64,37 @@ def add_missing_columns(df: DataFrame, target_schema: StructType) -> DataFrame:
 
     def _update_struct_column(df: DataFrame, field_name: str, current_field: StructField, 
                              target_field: StructField) -> DataFrame:
-        """Update an existing struct column to include missing nested fields."""
+        """Update an existing struct column to include missing nested fields and adjust nullability."""
         current_nested_fields = {f.name: f for f in current_field.dataType.fields}
         target_nested_fields = target_field.dataType.fields
         nested_columns = []
         
         for nested_field in target_nested_fields:
-            if nested_field.name in current_nested_fields:
-                # Preserve existing nested field
-                nested_columns.append(col(f"{field_name}.{nested_field.name}").alias(nested_field.name))
+            nested_field_name = nested_field.name
+            if nested_field_name in current_nested_fields:
+                nested_columns.append(
+                    col(f"{field_name}.{nested_field_name}").cast(nested_field.dataType).alias(nested_field_name)
+                )
             else:
-                # Add missing nested field as NULL
-                nested_columns.append(lit(None).cast(nested_field.dataType).alias(nested_field.name))
+                nested_columns.append(lit(None).cast(nested_field.dataType).alias(nested_field_name))
         
-        # Create new struct column with all fields
-        return df.withColumn(field_name, struct(*nested_columns))
+        # Create new struct expression
+        new_struct = struct(*nested_columns)
+        
+        # Replace {NULL, NULL, ...} with NULL
+        all_null_condition = " AND ".join(
+            f"{field_name}.{nested_field.name} IS NULL" for nested_field in target_nested_fields
+        )
+        transformed_struct = when(
+            expr(all_null_condition),
+            lit(None).cast(target_field.dataType)
+        ).otherwise(new_struct)
+        
+        return df.withColumn(field_name, transformed_struct)
 
     def _update_array_column(df: DataFrame, field_name: str, current_field: StructField, 
                             target_field: StructField) -> DataFrame:
-        """Update an existing array column to include missing nested fields in its struct elements."""
+        """Update an existing array column to include missing nested fields and adjust nullability."""
         if schemas_are_equal(current_field.dataType, target_field.dataType):
             return df
         
@@ -96,14 +109,27 @@ def add_missing_columns(df: DataFrame, target_schema: StructType) -> DataFrame:
                 else:
                     nested_columns.append(f"CAST(NULL AS {nested_field.dataType.simpleString()}) AS {nested_field_name}")
             
-            # Transform array elements using expr
+            # Transform array elements
             transform_expr = f"""
                 TRANSFORM({field_name}, x -> STRUCT({', '.join(nested_columns)}))
             """
-            return df.withColumn(field_name, expr(transform_expr).cast(target_field.dataType))
+            new_array = expr(transform_expr)
         else:
-            # Non-struct array, cast to target type
-            return df.withColumn(field_name, col(field_name).cast(target_field.dataType))
+            # Simple array, cast elements to target type
+            new_array = col(field_name)
+        
+        # Replace [] or all-null arrays with NULL
+        all_null_condition = f"""
+            {field_name} IS NOT NULL AND
+            (SIZE({field_name}) = 0 OR
+             SIZE(FILTER({field_name}, x -> x IS NOT NULL)) = 0)
+        """
+        transformed_array = when(
+            expr(all_null_condition),
+            lit(None).cast(target_field.dataType)
+        ).otherwise(new_array.cast(target_field.dataType))
+        
+        return df.withColumn(field_name, transformed_array)
 
     def _update_map_column(df: DataFrame, field_name: str, current_field: StructField, 
                           target_field: StructField) -> DataFrame:
@@ -122,7 +148,7 @@ def add_missing_columns(df: DataFrame, target_schema: StructType) -> DataFrame:
                 else:
                     nested_columns.append(f"CAST(NULL AS {nested_field.dataType.simpleString()}) AS {nested_field_name}")
             
-            # Transform map values using expr
+            # Transform map values
             transform_expr = f"""
                 MAP_FROM_ENTRIES(
                     TRANSFORM(MAP_ENTRIES({field_name}), x -> 
@@ -130,10 +156,23 @@ def add_missing_columns(df: DataFrame, target_schema: StructType) -> DataFrame:
                     )
                 )
             """
-            return df.withColumn(field_name, expr(transform_expr).cast(target_field.dataType))
+            new_map = expr(transform_expr)
         else:
-            # Simple map, reselect to avoid cast issues
-            return df.withColumn(field_name, col(field_name))
+            # Simple map, reselect and cast values
+            new_map = col(field_name)
+        
+        # Replace {} or maps with all null values with NULL
+        all_null_condition = f"""
+            {field_name} IS NOT NULL AND
+            (SIZE({field_name}) = 0 OR
+             SIZE(FILTER(MAP_VALUES({field_name}), x -> x IS NOT NULL)) = 0)
+        """
+        transformed_map = when(
+            expr(all_null_condition),
+            lit(None).cast(target_field.dataType)
+        ).otherwise(new_map.cast(target_field.dataType))
+        
+        return df.withColumn(field_name, transformed_map)
 
     # Get current DataFrame schema as a dictionary for lookup
     current_fields = {field.name: field for field in df.schema.fields}

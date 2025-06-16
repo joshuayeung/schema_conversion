@@ -257,3 +257,47 @@ def test_missing_struct_column_null(spark, simple_df, target_schema):
     # Verify info is NULL
     result_data = result_df.select("info").collect()
     assert all(row["info"] is None for row in result_data)
+
+def test_map_array_empty_to_null(spark):
+    """Test transforming empty maps/arrays to NULL with non-nullable values/elements."""
+    data = [
+        ("Alice", {}, [], {"key1": None}, [None]),
+        ("Bob", {"key1": "value1"}, ["item1"], {"key2": "value2"}, ["item2"])
+    ]
+    df_schema = StructType([
+        StructField("name", StringType(), True),
+        StructField("map_field", MapType(StringType(), StringType(), True), True),
+        StructField("array_field", ArrayType(StringType(), True), True),
+        StructField("map_null_values", MapType(StringType(), StringType(), True), True),
+        StructField("array_null_elements", ArrayType(StringType(), True), True)
+    ])
+    df = spark.createDataFrame(data, df_schema)
+    
+    target_schema = StructType([
+        StructField("name", StringType(), True),
+        StructField("map_field", MapType(StringType(), StringType(), False), True),
+        StructField("array_field", ArrayType(StringType(), False), True),
+        StructField("map_null_values", MapType(StringType(), StringType(), False), True),
+        StructField("array_null_elements", ArrayType(StringType(), False), True),
+        StructField("extra", StringType(), True)
+    ])
+    
+    result_df = add_missing_columns(df, target_schema)
+    
+    # Verify schema
+    assert result_df.schema == target_schema
+    
+    # Verify data
+    result_data = result_df.select("name", "map_field", "array_field", "map_null_values", "array_null_elements", "extra").collect()
+    assert result_data[0]["name"] == "Alice"
+    assert result_data[0]["map_field"] is None
+    assert result_data[0]["array_field"] is None
+    assert result_data[0]["map_null_values"] is None
+    assert result_data[0]["array_null_elements"] is None
+    assert result_data[0]["extra"] is None
+    assert result_data[1]["name"] == "Bob"
+    assert result_data[1]["map_field"] == {"key1": "value1"}
+    assert result_data[1]["array_field"] == ["item1"]
+    assert result_data[1]["map_null_values"] == {"key2": "value2"}
+    assert result_data[1]["array_null_elements"] == ["item2"]
+    assert result_data[1]["extra"] is None
