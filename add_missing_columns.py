@@ -5,6 +5,11 @@ from pyspark.sql.types import (
     DoubleType, BooleanType, BinaryType, TimestampType, DateType, DecimalType, DataType
 )
 from pyspark.sql.functions import lit, struct, col, transform, expr
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 def normalize_schema(schema: DataType) -> DataType:
     """
@@ -58,7 +63,11 @@ def add_missing_columns(df: DataFrame, target_schema: StructType) -> DataFrame:
         DataFrame: DataFrame with missing columns and nested fields added as NULL
     """
     def _create_null_column(field: StructField):
-        """Create a NULL column for a given field, including complex types."""
+        """Create a NULL column for a given field, ensuring StructType is not flattened."""
+        logger.info(f"Creating NULL column for field: {field.name} with type {field.dataType.simpleString()}")
+        if isinstance(field.dataType, StructType):
+            # Explicitly create a NULL struct to prevent flattening
+            return lit(None).cast(field.dataType)
         return lit(None).cast(field.dataType)
 
     def _update_struct_column(df: DataFrame, field_name: str, current_field: StructField, 
@@ -73,26 +82,20 @@ def add_missing_columns(df: DataFrame, target_schema: StructType) -> DataFrame:
             if nested_field_name in current_nested_fields:
                 current_nested_field = current_nested_fields[nested_field_name]
                 if isinstance(nested_field.dataType, StructType) and isinstance(current_nested_field.dataType, StructType):
-                    # Recursively update nested struct
                     temp_col_name = f"__temp_{field_name}_{nested_field_name}"
                     df = _update_struct_column(df, f"{field_name}.{nested_field_name}", current_nested_field, nested_field)
                     nested_columns.append(col(f"{field_name}.{nested_field_name}").alias(nested_field_name))
                 elif isinstance(nested_field.dataType, ArrayType) and isinstance(current_nested_field.dataType, ArrayType):
-                    # Update nested array
                     df = _update_array_column(df, f"{field_name}.{nested_field_name}", current_nested_field, nested_field)
                     nested_columns.append(col(f"{field_name}.{nested_field_name}").alias(nested_field_name))
                 elif isinstance(nested_field.dataType, MapType) and isinstance(current_nested_field.dataType, MapType):
-                    # Update nested map
                     df = _update_map_column(df, f"{field_name}.{nested_field_name}", current_nested_field, nested_field)
                     nested_columns.append(col(f"{field_name}.{nested_field_name}").alias(nested_field_name))
                 else:
-                    # Preserve existing primitive or non-matching field
                     nested_columns.append(col(f"{field_name}.{nested_field_name}").alias(nested_field_name))
             else:
-                # Add missing nested field as NULL
                 nested_columns.append(lit(None).cast(nested_field.dataType).alias(nested_field_name))
         
-        # Create new struct column with all fields
         return df.withColumn(field_name, struct(*nested_columns))
 
     def _update_array_column(df: DataFrame, field_name: str, current_field: StructField, 
@@ -111,17 +114,14 @@ def add_missing_columns(df: DataFrame, target_schema: StructType) -> DataFrame:
                 if nested_field_name in current_nested_fields:
                     current_nested_field = current_nested_fields[nested_field_name]
                     if isinstance(nested_field.dataType, StructType) and isinstance(current_nested_field.dataType, StructType):
-                        # Create a temporary array with updated structs
                         temp_array_col = f"__temp_array_{field_name}_{nested_field_name}"
                         df = _update_struct_column(df, f"{field_name}[*].{nested_field_name}", current_nested_field, nested_field)
                         nested_columns.append(f"x.{nested_field_name}")
                     elif isinstance(nested_field.dataType, ArrayType) and isinstance(current_nested_field.dataType, ArrayType):
-                        # Create a temporary array with updated arrays
                         temp_array_col = f"__temp_array_{field_name}_{nested_field_name}"
                         df = _update_array_column(df, f"{field_name}[*].{nested_field_name}", current_nested_field, nested_field)
                         nested_columns.append(f"x.{nested_field_name}")
                     elif isinstance(nested_field.dataType, MapType) and isinstance(current_nested_field.dataType, MapType):
-                        # Create a temporary array with updated maps
                         temp_array_col = f"__temp_array_{field_name}_{nested_field_name}"
                         df = _update_map_column(df, f"{field_name}[*].{nested_field_name}", current_nested_field, nested_field)
                         nested_columns.append(f"x.{nested_field_name}")
@@ -130,27 +130,23 @@ def add_missing_columns(df: DataFrame, target_schema: StructType) -> DataFrame:
                 else:
                     nested_columns.append(f"CAST(NULL AS {nested_field.dataType.simpleString()}) AS {nested_field_name}")
             
-            # Transform array elements using expr
             transform_expr = f"""
                 TRANSFORM({field_name}, x -> STRUCT({', '.join(nested_columns)}))
             """
             return df.withColumn(field_name, expr(transform_expr).cast(target_field.dataType))
         elif isinstance(target_field.dataType.elementType, ArrayType) and isinstance(current_field.dataType.elementType, ArrayType):
-            # Handle nested arrays
             temp_array_col = f"__temp_array_{field_name}"
             df = df.withColumn(temp_array_col, transform(col(field_name), lambda x: col(x)))
             df = _update_array_column(df, temp_array_col, StructField(temp_array_col, current_field.dataType.elementType), 
                                      StructField(temp_array_col, target_field.dataType.elementType))
             return df.withColumn(field_name, col(temp_array_col).cast(target_field.dataType)).drop(temp_array_col)
         elif isinstance(target_field.dataType.elementType, MapType) and isinstance(current_field.dataType.elementType, MapType):
-            # Handle nested maps
             temp_array_col = f"__temp_array_{field_name}"
             df = df.withColumn(temp_array_col, transform(col(field_name), lambda x: col(x)))
             df = _update_map_column(df, temp_array_col, StructField(temp_array_col, current_field.dataType.elementType), 
                                    StructField(temp_array_col, target_field.dataType.elementType))
             return df.withColumn(field_name, col(temp_array_col).cast(target_field.dataType)).drop(temp_array_col)
         else:
-            # Non-complex array, cast to target type
             return df.withColumn(field_name, col(field_name).cast(target_field.dataType))
 
     def _update_map_column(df: DataFrame, field_name: str, current_field: StructField, 
@@ -169,17 +165,14 @@ def add_missing_columns(df: DataFrame, target_schema: StructType) -> DataFrame:
                 if nested_field_name in current_nested_fields:
                     current_nested_field = current_nested_fields[nested_field_name]
                     if isinstance(nested_field.dataType, StructType) and isinstance(current_nested_field.dataType, StructType):
-                        # Create a temporary map with updated structs
                         temp_map_col = f"__temp_map_{field_name}_{nested_field_name}"
                         df = _update_struct_column(df, f"{field_name}.value.{nested_field_name}", current_nested_field, nested_field)
                         nested_columns.append(f"x.value.{nested_field_name}")
                     elif isinstance(nested_field.dataType, ArrayType) and isinstance(current_nested_field.dataType, ArrayType):
-                        # Create a temporary map with updated arrays
                         temp_map_col = f"__temp_map_{field_name}_{nested_field_name}"
                         df = _update_array_column(df, f"{field_name}.value.{nested_field_name}", current_nested_field, nested_field)
                         nested_columns.append(f"x.value.{nested_field_name}")
                     elif isinstance(nested_field.dataType, MapType) and isinstance(current_nested_field.dataType, MapType):
-                        # Create a temporary map with updated maps
                         temp_map_col = f"__temp_map_{field_name}_{nested_field_name}"
                         df = _update_map_column(df, f"{field_name}.value.{nested_field_name}", current_nested_field, nested_field)
                         nested_columns.append(f"x.value.{nested_field_name}")
@@ -188,7 +181,6 @@ def add_missing_columns(df: DataFrame, target_schema: StructType) -> DataFrame:
                 else:
                     nested_columns.append(f"CAST(NULL AS {nested_field.dataType.simpleString()}) AS {nested_field_name}")
             
-            # Transform map values using expr
             transform_expr = f"""
                 MAP_FROM_ENTRIES(
                     TRANSFORM(MAP_ENTRIES({field_name}), x -> 
@@ -198,7 +190,6 @@ def add_missing_columns(df: DataFrame, target_schema: StructType) -> DataFrame:
             """
             return df.withColumn(field_name, expr(transform_expr).cast(target_field.dataType))
         elif isinstance(target_field.dataType.valueType, ArrayType) and isinstance(current_field.dataType.valueType, ArrayType):
-            # Handle nested arrays as map values
             temp_map_col = f"__temp_map_{field_name}"
             df = df.withColumn(temp_map_col, expr(f"""
                 MAP_FROM_ENTRIES(
@@ -209,7 +200,6 @@ def add_missing_columns(df: DataFrame, target_schema: StructType) -> DataFrame:
                                      StructField("value", target_field.dataType.valueType))
             return df.withColumn(field_name, col(temp_map_col).cast(target_field.dataType)).drop(temp_map_col)
         elif isinstance(target_field.dataType.valueType, MapType) and isinstance(current_field.dataType.valueType, MapType):
-            # Handle nested maps as map values
             temp_map_col = f"__temp_map_{field_name}"
             df = df.withColumn(temp_map_col, expr(f"""
                 MAP_FROM_ENTRIES(
@@ -220,8 +210,29 @@ def add_missing_columns(df: DataFrame, target_schema: StructType) -> DataFrame:
                                    StructField("value", target_field.dataType.valueType))
             return df.withColumn(field_name, col(temp_map_col).cast(target_field.dataType)).drop(temp_map_col)
         else:
-            # Simple map, reselect to avoid cast issues
             return df.withColumn(field_name, col(field_name))
+
+    # Log target schema for debugging
+    logger.info("Target schema fields:")
+    for field in target_schema.fields:
+        logger.info(f"Field: {field.name}, Type: {field.dataType.simpleString()}")
+
+    # Validate target schema to prevent flattened fields
+    for field in target_schema.fields:
+        if "." in field.name:
+            logger.warning(f"Field name contains dot: {field.name}. This may indicate schema flattening.")
+
+    # Log input DataFrame schema
+    logger.info(f"Input DataFrame schema: {df.schema.simpleString()}")
+
+    # Check for existing columns that might conflict
+    current_columns = [field.name for field in df.schema.fields]
+    for target_field in target_schema.fields:
+        if isinstance(target_field.dataType, StructType):
+            for nested_field in target_field.dataType.fields:
+                conflicting_name = f"{target_field.name}.{nested_field.name}"
+                if conflicting_name in current_columns:
+                    logger.warning(f"Potential conflict: Column {conflicting_name} exists in DataFrame and may interfere with {target_field.name}")
 
     # Get current DataFrame schema as a dictionary for lookup
     current_fields = {field.name: field for field in df.schema.fields}
@@ -232,7 +243,10 @@ def add_missing_columns(df: DataFrame, target_schema: StructType) -> DataFrame:
         field_name = target_field.name
         if field_name not in current_fields:
             # Add missing top-level column as NULL
+            logger.info(f"Adding missing column: {field_name}")
             result_df = result_df.withColumn(field_name, _create_null_column(target_field))
+            # Log schema after adding column
+            logger.info(f"Schema after adding {field_name}: {result_df.schema.simpleString()}")
         else:
             # Check for nested field updates
             current_field = current_fields[field_name]
@@ -244,4 +258,15 @@ def add_missing_columns(df: DataFrame, target_schema: StructType) -> DataFrame:
                 result_df = _update_map_column(result_df, field_name, current_field, target_field)
             # Non-nested fields or type mismatches are preserved as-is
     
+    # Final schema validation
+    final_columns = [field.name for field in result_df.schema.fields]
+    for target_field in target_schema.fields:
+        if isinstance(target_field.dataType, StructType):
+            for nested_field in target_field.dataType.fields:
+                conflicting_name = f"{target_field.name}.{nested_field.name}"
+                if conflicting_name in final_columns:
+                    logger.error(f"Flattened column detected: {conflicting_name}. Expected single column {target_field.name}")
+                    raise ValueError(f"Flattened column {conflicting_name} found in output schema")
+
+    logger.info(f"Final DataFrame schema: {result_df.schema.simpleString()}")
     return result_df
