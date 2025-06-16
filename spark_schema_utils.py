@@ -20,11 +20,9 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
         field_name = f"{prefix}{field.name}" if prefix else field.name
         
         if isinstance(field_type, StructType):
-            # Check if the struct exists in the DataFrame
-            existing_struct_type = existing_field.dataType if existing_field and isinstance(existing_field.dataType, StructType) else None
+            existing_struct_type = existing_field.dataType if isinstance(existing_field, StructField) and isinstance(existing_field.dataType, StructType) else None
             existing_subfields = {f.name: f for f in existing_struct_type.fields} if existing_struct_type else {}
             
-            # Generate expressions for subfields
             subfield_exprs = []
             for subfield in field_type.fields:
                 existing_subfield = existing_subfields.get(subfield.name)
@@ -49,12 +47,13 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
                 return struct(*subfield_exprs).alias(field_name)
                 
         elif isinstance(field_type, ArrayType):
-            if existing_field and isinstance(existing_field.dataType, ArrayType):
-                if isinstance(field_type.elementType, StructType) or isinstance(field_type.elementType, ArrayType):
+            if isinstance(existing_field, StructField) and isinstance(existing_field.dataType, ArrayType):
+                if isinstance(field_type.elementType, (StructType, ArrayType)):
+                    existing_element_type = existing_field.dataType.elementType if isinstance(existing_field.dataType, ArrayType) else None
                     element_expr = get_field_expr(
                         StructField(field.name, field_type.elementType, True),
                         prefix="",
-                        existing_field=existing_field.dataType if existing_field else None
+                        existing_field=existing_element_type if isinstance(existing_element_type, (StructType, StructField)) else None
                     )
                     return when(
                         col(field_name).isNotNull(),
@@ -67,7 +66,7 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
             return array().cast(field_type).alias(field_name)
             
         elif isinstance(field_type, MapType):
-            if existing_field and isinstance(existing_field.dataType, MapType):
+            if isinstance(existing_field, StructField) and isinstance(existing_field.dataType, MapType):
                 return col(field_name)
             # Create an empty map of the correct type
             return map_from_arrays(array(), array()).cast(field_type).alias(field_name)
@@ -151,7 +150,6 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
         elif isinstance(field_type, ArrayType):
             # For arrays, process each element recursively
             if field.nullable and isinstance(field_type.elementType, StructType):
-                # Process struct elements using transform
                 element_condition = build_null_condition(
                     StructField("element", field_type.elementType, True),
                     prefix="",
@@ -164,7 +162,6 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
                     transform(col(field_name), lambda x: element_condition).cast(field_type)
                 ).alias(field_name)
             elif field.nullable and isinstance(field_type.elementType, ArrayType):
-                # Process nested arrays
                 element_condition = build_null_condition(
                     StructField("element", field_type.elementType, True),
                     prefix="",
