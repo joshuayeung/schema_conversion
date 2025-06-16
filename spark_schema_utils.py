@@ -1,6 +1,6 @@
 from pyspark.sql import DataFrame
 from pyspark.sql.types import StructType, StructField, ArrayType, MapType, NullType
-from pyspark.sql.functions import lit, col, coalesce, array, struct, map_from_arrays, expr
+from pyspark.sql.functions import lit, col, array, struct, map_from_arrays
 
 def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
     """
@@ -26,49 +26,42 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
             subfield_exprs = []
             for subfield in field_type.fields:
                 existing_subfield = existing_subfields.get(subfield.name)
-                subfield_expr = get_field_expr(
-                    subfield,
-                    f"{field_name}." if field_name else "",
-                    existing_subfield
-                )
+                if existing_subfield and isinstance(existing_field, StructField):
+                    # Use existing subfield if available
+                    subfield_expr = col(f"{field_name}.{subfield.name}")
+                    # Recursively ensure nested subfields are added
+                    if isinstance(subfield.dataType, (StructType, ArrayType, MapType)):
+                        nested_expr = get_field_expr(
+                            subfield,
+                            f"{field_name}." if field_name else "",
+                            existing_subfield
+                        )
+                        subfield_expr = nested_expr
+                else:
+                    # Generate NULL expression for missing subfield
+                    subfield_expr = get_field_expr(
+                        subfield,
+                        f"{field_name}." if field_name else "",
+                        None
+                    )
                 subfield_expr = subfield_expr.alias(subfield.name)
                 subfield_exprs.append(subfield_expr)
             
-            if isinstance(existing_field, StructField):
-                return coalesce(col(field_name), struct(*subfield_exprs)).alias(field_name)
             return struct(*subfield_exprs).alias(field_name)
                 
         elif isinstance(field_type, ArrayType):
             if isinstance(existing_field, StructField) and isinstance(existing_field.dataType, ArrayType):
-                if isinstance(field_type.elementType, (StructType, ArrayType)):
-                    # Create a temporary struct field for the element type
-                    element_field = StructField("element", field_type.elementType, True)
-                    existing_element_field = StructField("element", existing_field.dataType.elementType, True) if isinstance(existing_field.dataType.elementType, (StructType, ArrayType)) else None
-                    element_expr = get_field_expr(element_field, "", existing_element_field)
-                    # Use expr to construct array elements, avoiding lambda variables
-                    return coalesce(
-                        col(field_name),
-                        array().cast(field_type)
-                    ).alias(field_name)
-                return col(field_name)
+                return col(field_name).alias(field_name)
             return array().cast(field_type).alias(field_name)
             
         elif isinstance(field_type, MapType):
             if isinstance(existing_field, StructField) and isinstance(existing_field.dataType, MapType):
-                if isinstance(field_type.valueType, (StructType, MapType)):
-                    value_field = StructField("value", field_type.valueType, True)
-                    existing_value_field = StructField("value", existing_field.dataType.valueType, True) if isinstance(existing_field.dataType.valueType, (StructType, MapType)) else None
-                    value_expr = get_field_expr(value_field, "", existing_value_field)
-                    return coalesce(
-                        col(field_name),
-                        map_from_arrays(array(), array()).cast(field_type)
-                    ).alias(field_name)
-                return col(field_name)
+                return col(field_name).alias(field_name)
             return map_from_arrays(array(), array()).cast(field_type).alias(field_name)
             
         else:
             if isinstance(existing_field, StructField):
-                return col(field_name)
+                return col(field_name).alias(field_name)
             return lit(None).cast(field_type).alias(field_name)
     
     existing_columns = {f.name: f for f in df.schema.fields}
