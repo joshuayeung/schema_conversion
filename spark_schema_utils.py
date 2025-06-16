@@ -14,7 +14,7 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
     Returns:
         DataFrame with all columns and nested subfields from the schema, missing ones added as NULL
     """
-    def get_field_expr(field: StructField, prefix: str = "", existing_field: StructField = None) -> str:
+    def get_field_expr(field: StructField, prefix: str = "", existing_field: StructField = None, return_sql: bool = False) -> str:
         """Generate expression for a field, handling nested structures and existing fields."""
         field_type = field.dataType
         field_name = f"{prefix}{field.name}" if prefix else field.name
@@ -24,26 +24,34 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
             existing_subfields = {f.name: f for f in existing_struct_type.fields} if existing_struct_type else {}
             
             subfield_exprs = []
+            subfield_sqls = []
             for subfield in field_type.fields:
                 existing_subfield = existing_subfields.get(subfield.name)
                 if existing_subfield and isinstance(existing_field, StructField):
                     subfield_expr = col(f"{field_name}.{subfield.name}")
+                    subfield_sql = f"{field_name}.{subfield.name}"
                     if isinstance(subfield.dataType, (StructType, ArrayType, MapType)):
-                        nested_expr = get_field_expr(
+                        nested_expr, nested_sql = get_field_expr(
                             subfield,
                             f"{field_name}." if field_name else "",
-                            existing_subfield
+                            existing_subfield,
+                            return_sql=True
                         )
                         subfield_expr = nested_expr
+                        subfield_sql = nested_sql
                 else:
-                    subfield_expr = get_field_expr(
+                    subfield_expr, subfield_sql = get_field_expr(
                         subfield,
                         f"{field_name}." if field_name else "",
-                        None
+                        None,
+                        return_sql=True
                     )
                 subfield_expr = subfield_expr.alias(subfield.name)
                 subfield_exprs.append(subfield_expr)
+                subfield_sqls.append(f"{subfield_sql} AS {subfield.name}")
             
+            if return_sql:
+                return struct(*subfield_exprs), f"STRUCT({', '.join(subfield_sqls)})"
             return struct(*subfield_exprs).alias(field_name)
                 
         elif isinstance(field_type, ArrayType):
@@ -51,43 +59,81 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
                 if isinstance(field_type.elementType, StructType):
                     element_field = StructField("element", field_type.elementType, True)
                     existing_element_field = StructField("element", existing_field.dataType.elementType, True) if isinstance(existing_field.dataType.elementType, StructType) else None
-                    element_expr = get_field_expr(element_field, "element", existing_element_field)
-                    return when(
+                    _, element_sql = get_field_expr(element_field, "element", existing_element_field, return_sql=True)
+                    array_expr = when(
                         col(field_name).isNotNull(),
                         expr(f"""
-                            (SELECT ARRAY_AGG({element_expr})
+                            (SELECT ARRAY_AGG({element_sql})
                              FROM (SELECT EXPLODE(COALESCE({field_name}, ARRAY())) AS element))
                         """)
                     ).otherwise(
                         array().cast(field_type)
                     ).alias(field_name)
-                return col(field_name).alias(field_name)
-            return array().cast(field_type).alias(field_name)
+                    if return_sql:
+                        return array_expr, f"""
+                            CASE WHEN {field_name} IS NOT NULL
+                                 THEN (SELECT ARRAY_AGG({element_sql})
+                                       FROM (SELECT EXPLODE(COALESCE({field_name}, ARRAY())) AS element))
+                                 ELSE ARRAY()
+                            END
+                        """
+                    return array_expr
+                array_expr = col(field_name).alias(field_name)
+                if return_sql:
+                    return array_expr, field_name
+                return array_expr
+            array_expr = array().cast(field_type).alias(field_name)
+            if return_sql:
+                return array_expr, "ARRAY()"
+            return array_expr
             
         elif isinstance(field_type, MapType):
             if isinstance(existing_field, StructField) and isinstance(existing_field.dataType, MapType):
                 if isinstance(field_type.valueType, StructType):
                     value_field = StructField("value", field_type.valueType, True)
                     existing_value_field = StructField("value", existing_field.dataType.valueType, True) if isinstance(existing_field.dataType.valueType, StructType) else None
-                    value_expr = get_field_expr(value_field, "value", existing_value_field)
-                    return when(
+                    _, value_sql = get_field_expr(value_field, "value", existing_value_field, return_sql=True)
+                    map_expr = when(
                         col(field_name).isNotNull(),
                         expr(f"""
                             TRANSFORM_VALUES(
                                 COALESCE({field_name}, MAP()),
-                                (k, v) -> (SELECT {value_expr} FROM (SELECT v AS value))
+                                (k, v) -> {value_sql}
                             )
                         """)
                     ).otherwise(
                         map_from_arrays(array(), array()).cast(field_type)
                     ).alias(field_name)
-                return col(field_name).alias(field_name)
-            return map_from_arrays(array(), array()).cast(field_type).alias(field_name)
+                    if return_sql:
+                        return map_expr, f"""
+                            CASE WHEN {field_name} IS NOT NULL
+                                 THEN TRANSFORM_VALUES(
+                                      COALESCE({field_name}, MAP()),
+                                      (k, v) -> {value_sql}
+                                 )
+                                 ELSE MAP()
+                            END
+                        """
+                    return map_expr
+                map_expr = col(field_name).alias(field_name)
+                if return_sql:
+                    return map_expr, field_name
+                return map_expr
+            map_expr = map_from_arrays(array(), array()).cast(field_type).alias(field_name)
+            if return_sql:
+                return map_expr, "MAP()"
+            return map_expr
             
         else:
             if isinstance(existing_field, StructField):
-                return col(field_name).alias(field_name)
-            return lit(None).cast(field_type).alias(field_name)
+                column_expr = col(field_name).alias(field_name)
+                sql_expr = field_name
+            else:
+                column_expr = lit(None).cast(field_type).alias(field_name)
+                sql_expr = f"CAST(NULL AS {field_type.simpleString()})"
+            if return_sql:
+                return column_expr, sql_expr
+            return column_expr
     
     existing_columns = {f.name: f for f in df.schema.fields}
     select_expr = []
