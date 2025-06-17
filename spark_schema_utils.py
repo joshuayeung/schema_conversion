@@ -72,7 +72,27 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
                 if isinstance(field_type.elementType, StructType):
                     element_field = StructField("_elem", field_type.elementType, True)
                     existing_element_field = StructField("_elem", existing_field.dataType.elementType, True) if isinstance(existing_field.dataType.elementType, StructType) else None
-                    element_expr, element_sql = get_field_expr(element_field, "", existing_element_field, return_sql=True)
+                    # Build struct SQL explicitly for array elements
+                    element_struct_type = field_type.elementType
+                    existing_element_struct = existing_element_field.dataType if existing_element_field else None
+                    existing_element_subfields = {f.name: f for f in existing_element_struct.fields} if existing_element_struct else {}
+                    element_sql_parts = []
+                    for subfield in element_struct_type.fields:
+                        if subfield.name in existing_element_subfields:
+                            element_sql_parts.append(f"_elem.{subfield.name} AS {subfield.name}")
+                        else:
+                            subfield_expr, subfield_sql = get_field_expr(subfield, "", None, return_sql=True)
+                            element_sql_parts.append(f"{subfield_sql} AS {subfield.name}")
+                    element_sql = f"STRUCT({', '.join(element_sql_parts)})"
+                    # Build column expression for array
+                    element_exprs = []
+                    for subfield in element_struct_type.fields:
+                        if subfield.name in existing_element_subfields:
+                            element_expr = col(f"_elem.{subfield.name}")
+                        else:
+                            element_expr, _ = get_field_expr(subfield, "", None, return_sql=True)
+                        element_exprs.append(element_expr.alias(subfield.name))
+                    element_expr = struct(*element_exprs)
                     array_expr = when(
                         col(field_name).isNotNull(),
                         expr(f"""
