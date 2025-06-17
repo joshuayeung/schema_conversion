@@ -57,13 +57,13 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
         elif isinstance(field_type, ArrayType):
             if isinstance(existing_field, StructField) and isinstance(existing_field.dataType, ArrayType):
                 if isinstance(field_type.elementType, StructType):
-                    element_field = StructField("elem", field_type.elementType, True)  # Unique alias to avoid conflicts
-                    existing_element_field = StructField("elem", existing_field.dataType.elementType, True) if isinstance(existing_field.dataType.elementType, StructType) else None
-                    _, element_sql = get_field_expr(element_field, "elem.", existing_element_field, return_sql=True)
+                    element_field = StructField("_elem", field_type.elementType, True)  # Temporary name for schema processing
+                    existing_element_field = StructField("_elem", existing_field.dataType.elementType, True) if isinstance(existing_field.dataType.elementType, StructType) else None
+                    _, element_sql = get_field_expr(element_field, "", existing_element_field, return_sql=True)
                     array_expr = when(
                         col(field_name).isNotNull(),
                         expr(f"""
-                            (SELECT ARRAY_AGG({element_sql})
+                            (SELECT ARRAY_AGG(STRUCT(elem.*))
                              FROM (SELECT EXPLODE(COALESCE({field_name}, ARRAY())) AS elem))
                         """)
                     ).otherwise(
@@ -72,7 +72,7 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
                     if return_sql:
                         return array_expr, f"""
                             CASE WHEN {field_name} IS NOT NULL
-                                 THEN (SELECT ARRAY_AGG({element_sql})
+                                 THEN (SELECT ARRAY_AGG(STRUCT(elem.*))
                                        FROM (SELECT EXPLODE(COALESCE({field_name}, ARRAY())) AS elem))
                                  ELSE ARRAY()
                             END
@@ -90,9 +90,9 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
         elif isinstance(field_type, MapType):
             if isinstance(existing_field, StructField) and isinstance(existing_field.dataType, MapType):
                 if isinstance(field_type.valueType, StructType):
-                    value_field = StructField("val", field_type.valueType, True)  # Unique alias to avoid conflicts
-                    existing_value_field = StructField("val", existing_field.dataType.valueType, True) if isinstance(existing_field.dataType.valueType, StructType) else None
-                    _, value_sql = get_field_expr(value_field, "val.", existing_value_field, return_sql=True)
+                    value_field = StructField("_val", field_type.valueType, True)  # Temporary name for schema processing
+                    existing_value_field = StructField("_val", existing_field.dataType.valueType, True) if isinstance(existing_field.dataType.valueType, StructType) else None
+                    _, value_sql = get_field_expr(value_field, "", existing_value_field, return_sql=True)
                     map_expr = when(
                         col(field_name).isNotNull(),
                         expr(f"""
@@ -146,7 +146,7 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
 
 def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
     """
-    Normalizes nullability in a PySpark DataFrame based on the schema.
+    Normalizes nullability in a PySpark DataFrame based on the provided schema.
     For optional structs/maps/arrays with required nested fields, sets the entire
     field to NULL if all required nested fields are NULL.
     
