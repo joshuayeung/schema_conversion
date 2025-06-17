@@ -52,20 +52,20 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
             
             if not subfield_exprs:  # Handle empty struct
                 if isinstance(existing_field, StructField):
-                    expr = col(field_name)
+                    col_expr = col(field_name)
                     sql = field_name
                 else:
-                    expr = lit(None).cast(field_type)
+                    col_expr = lit(None).cast(field_type)
                     sql = f"CAST(NULL AS {field_type.simpleString()})"
                 if return_sql:
-                    return expr, sql
-                return expr.alias(field_name)
+                    return col_expr, sql
+                return col_expr.alias(field_name)
             
-            expr = struct(*subfield_exprs)
+            col_expr = struct(*subfield_exprs)
             sql = f"STRUCT({', '.join(subfield_sqls)})"
             if return_sql:
-                return expr, sql
-            return expr.alias(field_name)
+                return col_expr, sql
+            return col_expr.alias(field_name)
                 
         elif isinstance(field_type, ArrayType):
             if isinstance(existing_field, StructField) and isinstance(existing_field.dataType, ArrayType):
@@ -92,16 +92,16 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
                     if return_sql:
                         return array_expr, array_sql
                     return array_expr.alias(field_name)
-                expr = col(field_name)
+                col_expr = col(field_name)
                 sql = field_name
                 if return_sql:
-                    return expr, sql
-                return expr.alias(field_name)
-            expr = array().cast(field_type)
+                    return col_expr, sql
+                return col_expr.alias(field_name)
+            col_expr = array().cast(field_type)
             sql = "ARRAY()"
             if return_sql:
-                return expr, sql
-            return expr.alias(field_name)
+                return col_expr, sql
+            return col_expr.alias(field_name)
             
         elif isinstance(field_type, MapType):
             if isinstance(existing_field, StructField) and isinstance(existing_field.dataType, MapType):
@@ -132,27 +132,27 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
                     if return_sql:
                         return map_expr, map_sql
                     return map_expr.alias(field_name)
-                expr = col(field_name)
+                col_expr = col(field_name)
                 sql = field_name
                 if return_sql:
-                    return expr, sql
-                return expr.alias(field_name)
-            expr = map_from_arrays(array(), array()).cast(field_type)
+                    return col_expr, sql
+                return col_expr.alias(field_name)
+            col_expr = map_from_arrays(array(), array()).cast(field_type)
             sql = "MAP()"
             if return_sql:
-                return expr, sql
-            return expr.alias(field_name)
+                return col_expr, sql
+            return col_expr.alias(field_name)
             
         else:
             if isinstance(existing_field, StructField):
-                expr = col(field_name)
+                col_expr = col(field_name)
                 sql = field_name
             else:
-                expr = lit(None).cast(field_type)
+                col_expr = lit(None).cast(field_type)
                 sql = f"CAST(NULL AS {field_type.simpleString()})"
             if return_sql:
-                return expr, sql
-            return expr.alias(field_name)
+                return col_expr, sql
+            return col_expr.alias(field_name)
     
     existing_columns = {f.name: f for f in df.schema.fields}
     select_expr = []
