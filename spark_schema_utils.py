@@ -1,6 +1,6 @@
 from pyspark.sql import DataFrame
 from pyspark.sql.types import StructType, StructField, ArrayType, MapType
-from pyspark.sql.functions import lit, col, struct, array, map_from_arrays, when, coalesce, expr, size, filter
+from pyspark.sql.functions import lit, col, struct, array, map_from_arrays, when, coalesce, expr, size, filter, transform
 
 def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
     """
@@ -174,7 +174,8 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
     For optional structs/maps with required nested fields, sets the entire
     field to NULL if all required nested fields are NULL. For optional arrays,
     sets to NULL if empty or NULL. For non-nullable arrays, sets to NULL if
-    empty, NULL, or all required nested fields are NULL.
+    empty, NULL, or all required nested fields are NULL. Recursively normalizes
+    nested arrays and structs at any level.
     
     Args:
         df: Input PySpark DataFrame
@@ -184,7 +185,7 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
         DataFrame with normalized NULL values for nested structures
     """
     def build_null_condition(field: StructField, prefix: str = "", existing_field: StructField = None) -> any:
-        """Build condition to check if a field should be set to NULL."""
+        """Build condition to check if a field should be set to NULL, recursively handling nested structures."""
         field_type = field.dataType
         field_name = f"{prefix}{field.name}" if prefix else field.name
         
@@ -200,15 +201,16 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
             conditions = []
             for subfield in field_type.fields:
                 existing_subfield = existing_subfields.get(subfield.name)
+                subfield_prefix = f"{field_name}." if field_name else ""
                 subfield_expr = build_null_condition(
                     subfield,
-                    f"{field_name}." if field_name else "",
+                    subfield_prefix,
                     existing_subfield
                 )
                 subfield_expr = subfield_expr.alias(subfield.name)
                 subfield_exprs.append(subfield_expr)
                 if not subfield.nullable:
-                    conditions.append(col(f"{field_name}.{subfield.name}").isNull())
+                    conditions.append(col(f"{subfield_prefix}{subfield.name}").isNull())
             
             combined_condition = conditions[0] if conditions else lit(True)
             for cond in conditions[1:]:
@@ -224,13 +226,34 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
             return struct(*subfield_exprs).alias(field_name)
                 
         elif isinstance(field_type, ArrayType):
+            # Handle array elements recursively if they are structs
+            if isinstance(field_type.elementType, StructType):
+                element_struct_type = field_type.elementType
+                element_field = StructField("_elem", element_struct_type, True)
+                # Transform elements to normalize nested fields
+                element_exprs = []
+                for subfield in element_struct_type.fields:
+                    # Use _elem as prefix for element fields
+                    subfield_expr = build_null_condition(
+                        subfield,
+                        prefix="_elem.",
+                        existing_field=subfield
+                    )
+                    element_exprs.append(subfield_expr.alias(subfield.name))
+                transformed_elements = transform(
+                    col(field_name),
+                    lambda x: struct(*[e for e in element_exprs]).alias("_elem")
+                )
+            else:
+                transformed_elements = col(field_name)
+            
             if field.nullable:
                 # Optional arrays: set to NULL if NULL or empty
                 return when(
                     col(field_name).isNull() | (size(col(field_name)) == 0),
                     lit(None)
                 ).otherwise(
-                    col(field_name)
+                    transformed_elements
                 ).alias(field_name)
             else:
                 # Non-nullable arrays: check if empty or all required fields are NULL
@@ -256,7 +279,7 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
                         col(field_name).isNull() | (size(col(field_name)) == 0) | combined_condition,
                         lit(None)
                     ).otherwise(
-                        col(field_name)
+                        transformed_elements
                     ).alias(field_name)
                 
                 # Non-nullable arrays without required fields: NULL if empty
@@ -264,18 +287,33 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
                     col(field_name).isNull() | (size(col(field_name)) == 0),
                     lit(None)
                 ).otherwise(
-                    col(field_name)
+                    transformed_elements
                 ).alias(field_name)
             
         elif isinstance(field_type, MapType):
+            if isinstance(field_type.valueType, StructType):
+                value_field = StructField("_val", field_type.valueType, True)
+                value_expr = build_null_condition(value_field, prefix="_val.")
+                map_expr = when(
+                    col(field_name).isNotNull(),
+                    transform_values(
+                        col(field_name),
+                        lambda k, v: value_expr
+                    )
+                ).otherwise(
+                    map_from_arrays(array(), array()).cast(field_type)
+                )
+            else:
+                map_expr = col(field_name)
+            
             if field.nullable:
                 return when(
                     col(field_name).isNull() | (size(map_keys(col(field_name))) == 0),
                     lit(None)
                 ).otherwise(
-                    col(field_name)
+                    map_expr
                 ).alias(field_name)
-            return col(field_name).alias(field_name)
+            return map_expr.alias(field_name)
             
         else:
             return col(field_name).alias(field_name)
