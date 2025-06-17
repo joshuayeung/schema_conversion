@@ -14,7 +14,7 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
     Returns:
         DataFrame with all columns and nested subfields from the schema, missing ones added as NULL
     """
-    def get_field_expr(field: StructField, prefix: str = "", existing_field: StructField = None, return_sql: bool = False) -> str:
+    def get_field_expr(field: StructField, prefix: str = "", existing_field: StructField = None, return_sql: bool = False) -> tuple:
         """Generate expression for a field, handling nested structures and existing fields."""
         field_type = field.dataType
         field_name = f"{prefix}{field.name}" if prefix else field.name
@@ -27,13 +27,14 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
             subfield_sqls = []
             for subfield in field_type.fields:
                 existing_subfield = existing_subfields.get(subfield.name)
+                subfield_prefix = f"{field_name}." if field_name else ""
                 if existing_subfield and isinstance(existing_field, StructField):
                     subfield_expr = col(f"{field_name}.{subfield.name}")
                     subfield_sql = f"{field_name}.{subfield.name}"
                     if isinstance(subfield.dataType, (StructType, ArrayType, MapType)):
                         nested_expr, nested_sql = get_field_expr(
                             subfield,
-                            f"{field_name}." if field_name else "",
+                            subfield_prefix,
                             existing_subfield,
                             return_sql=True
                         )
@@ -42,12 +43,11 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
                 else:
                     subfield_expr, subfield_sql = get_field_expr(
                         subfield,
-                        f"{field_name}." if field_name else "",
+                        subfield_prefix,
                         None,
                         return_sql=True
                     )
                 subfield_expr = subfield_expr.alias(subfield.name)
-                subfield_exprs.append(subfield_expr)
                 subfield_sqls.append(f"{subfield_sql} AS {subfield.name}")
             
             if return_sql:
@@ -57,14 +57,14 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
         elif isinstance(field_type, ArrayType):
             if isinstance(existing_field, StructField) and isinstance(existing_field.dataType, ArrayType):
                 if isinstance(field_type.elementType, StructType):
-                    element_field = StructField("element", field_type.elementType, True)
-                    existing_element_field = StructField("element", existing_field.dataType.elementType, True) if isinstance(existing_field.dataType.elementType, StructType) else None
-                    _, element_sql = get_field_expr(element_field, "element", existing_element_field, return_sql=True)
+                    element_field = StructField("elem", field_type.elementType, True)  # Unique alias to avoid conflicts
+                    existing_element_field = StructField("elem", existing_field.dataType.elementType, True) if isinstance(existing_field.dataType.elementType, StructType) else None
+                    _, element_sql = get_field_expr(element_field, "elem.", existing_element_field, return_sql=True)
                     array_expr = when(
                         col(field_name).isNotNull(),
                         expr(f"""
                             (SELECT ARRAY_AGG({element_sql})
-                             FROM (SELECT EXPLODE(COALESCE({field_name}, ARRAY())) AS element))
+                             FROM (SELECT EXPLODE(COALESCE({field_name}, ARRAY())) AS elem))
                         """)
                     ).otherwise(
                         array().cast(field_type)
@@ -73,7 +73,7 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
                         return array_expr, f"""
                             CASE WHEN {field_name} IS NOT NULL
                                  THEN (SELECT ARRAY_AGG({element_sql})
-                                       FROM (SELECT EXPLODE(COALESCE({field_name}, ARRAY())) AS element))
+                                       FROM (SELECT EXPLODE(COALESCE({field_name}, ARRAY())) AS elem))
                                  ELSE ARRAY()
                             END
                         """
@@ -90,9 +90,9 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
         elif isinstance(field_type, MapType):
             if isinstance(existing_field, StructField) and isinstance(existing_field.dataType, MapType):
                 if isinstance(field_type.valueType, StructType):
-                    value_field = StructField("value", field_type.valueType, True)
-                    existing_value_field = StructField("value", existing_field.dataType.valueType, True) if isinstance(existing_field.dataType.valueType, StructType) else None
-                    _, value_sql = get_field_expr(value_field, "value", existing_value_field, return_sql=True)
+                    value_field = StructField("val", field_type.valueType, True)  # Unique alias to avoid conflicts
+                    existing_value_field = StructField("val", existing_field.dataType.valueType, True) if isinstance(existing_field.dataType.valueType, StructType) else None
+                    _, value_sql = get_field_expr(value_field, "val.", existing_value_field, return_sql=True)
                     map_expr = when(
                         col(field_name).isNotNull(),
                         expr(f"""
