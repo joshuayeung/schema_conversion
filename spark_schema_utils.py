@@ -183,13 +183,14 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
     Returns:
         DataFrame with normalized NULL values for nested structures
     """
-    def is_field_empty(col_expr: Any, field_type: Any) -> Any:
+    def is_field_empty(col_expr: Any, field_type: Any, prefix: str = "") -> Any:
         """Check if a field is effectively empty (NULL, empty array, or struct with all fields empty)."""
         if isinstance(field_type, StructType):
             conditions = []
             for subfield in field_type.fields:
+                subfield_name = f"{prefix}{subfield.name}" if prefix else subfield.name
                 subfield_col = col_expr[subfield.name]
-                conditions.append(is_field_empty(subfield_col, subfield.dataType))
+                conditions.append(is_field_empty(subfield_col, subfield.dataType, f"{subfield_name}."))
             return coalesce(*conditions, lit(True))
         elif isinstance(field_type, ArrayType):
             return col_expr.isNull() | (size(col_expr) == 0)
@@ -207,9 +208,10 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
             subfield_exprs = []
             conditions = []
             for subfield in field_type.fields:
-                current_df, subfield_expr = normalize_struct(current_df, subfield, col_expr[subfield.name], f"{field_name}.")
+                subfield_prefix = f"{field_name}." if field_name else ""
+                current_df, subfield_expr = normalize_struct(current_df, subfield, col_expr[subfield.name], subfield_prefix)
                 subfield_exprs.append(subfield_expr.alias(subfield.name))
-                conditions.append(is_field_empty(col(f"{field_name}.{subfield.name}"), subfield.dataType))
+                conditions.append(is_field_empty(col_expr[subfield.name], subfield.dataType, subfield_prefix))
             
             combined_condition = conditions[0] if conditions else lit(True)
             for cond in conditions[1:]:
@@ -231,8 +233,11 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
             # Explode array and normalize elements
             element_type = field_type.elementType
             temp_col = f"_elem_{field_name.replace('.', '_')}"
+            
+            # Select only top-level columns explicitly to avoid ambiguity
+            select_cols = [col(c).alias(c) for c in current_df.columns if c != field_name]
             exploded_df = current_df.select(
-                "*",
+                *select_cols,
                 explode_outer(col(field_name)).alias(temp_col)
             )
             
