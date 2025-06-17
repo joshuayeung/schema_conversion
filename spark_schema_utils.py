@@ -186,7 +186,7 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
     def build_null_condition(field: StructField, prefix: str = "", existing_field: Optional[StructField] = None, is_array_element: bool = False) -> Any:
         """Build condition to check if a field should be set to NULL, recursively handling nested structures."""
         field_type = field.dataType
-        field_name = field.name if is_array_element else (f"{prefix}{field.name}" if prefix else field.name)
+        field_name = f"{prefix}{field.name}" if prefix and not is_array_element else field.name
         
         if isinstance(field_type, StructType):
             existing_struct_type = existing_field.dataType if isinstance(existing_field, StructField) and isinstance(existing_field.dataType, StructType) else None
@@ -198,7 +198,7 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
             
             for subfield in field_type.fields:
                 existing_subfield = existing_subfields.get(subfield.name)
-                subfield_prefix = f"{field_name}." if field_name else ""
+                subfield_prefix = f"{field_name}." if field_name and not is_array_element else ""
                 subfield_expr = build_null_condition(
                     subfield,
                     subfield_prefix,
@@ -211,7 +211,7 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
                     conditions.append(col(f"{subfield_prefix}{subfield.name}").isNull())
             
             if not required_fields:
-                return col(field_name).alias(field_name) if field_name else struct(*subfield_exprs)
+                return col(field_name).alias(field_name) if field_name and not is_array_element else struct(*subfield_exprs)
             
             combined_condition = conditions[0] if conditions else lit(True)
             for cond in conditions[1:]:
@@ -223,28 +223,31 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
                     lit(None)
                 ).otherwise(
                     struct(*subfield_exprs)
-                ).alias(field_name) if field_name else when(
+                ).alias(field_name) if field_name and not is_array_element else when(
                     combined_condition,
                     lit(None)
                 ).otherwise(struct(*subfield_exprs))
-            return struct(*subfield_exprs).alias(field_name) if field_name else struct(*subfield_exprs)
+            return struct(*subfield_exprs).alias(field_name) if field_name and not is_array_element else struct(*subfield_exprs)
                 
         elif isinstance(field_type, ArrayType):
-            if is_array_element:
-                col_ref = col(field_name)
-            else:
-                col_ref = col(field_name)
+            col_ref = col(field_name) if not is_array_element else col("x")
             
             # Handle array elements recursively if they are structs
             if isinstance(field_type.elementType, StructType):
                 element_struct_type = field_type.elementType
-                transformed_elements = transform(
-                    col_ref,
-                    lambda x: build_null_condition(
-                        StructField("element", element_struct_type, True),
+                element_exprs = []
+                for subfield in element_struct_type.fields:
+                    # Use 'x' as the alias for the array element in the lambda
+                    subfield_expr = build_null_condition(
+                        subfield,
                         prefix="",
+                        existing_field=subfield,
                         is_array_element=True
                     )
+                    element_exprs.append(subfield_expr.alias(subfield.name))
+                transformed_elements = transform(
+                    col_ref,
+                    lambda x: struct(*element_exprs)
                 )
             else:
                 transformed_elements = col_ref
