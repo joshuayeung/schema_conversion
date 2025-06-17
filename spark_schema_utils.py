@@ -50,6 +50,18 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
                 subfield_expr = subfield_expr.alias(subfield.name)
                 subfield_sqls.append(f"{subfield_sql} AS {subfield.name}")
             
+            # Handle empty struct case
+            if not subfield_exprs:
+                if isinstance(existing_field, StructField):
+                    expr = col(field_name).alias(field_name)
+                    sql = field_name
+                else:
+                    expr = lit(None).cast(field_type).alias(field_name)
+                    sql = f"CAST(NULL AS {field_type.simpleString()})"
+                if return_sql:
+                    return expr, sql
+                return expr
+            
             if return_sql:
                 return struct(*subfield_exprs), f"STRUCT({', '.join(subfield_sqls)})"
             return struct(*subfield_exprs).alias(field_name)
@@ -57,7 +69,7 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
         elif isinstance(field_type, ArrayType):
             if isinstance(existing_field, StructField) and isinstance(existing_field.dataType, ArrayType):
                 if isinstance(field_type.elementType, StructType):
-                    element_field = StructField("_elem", field_type.elementType, True)  # Temporary name for schema processing
+                    element_field = StructField("_elem", field_type.elementType, True)
                     existing_element_field = StructField("_elem", existing_field.dataType.elementType, True) if isinstance(existing_field.dataType.elementType, StructType) else None
                     _, element_sql = get_field_expr(element_field, "", existing_element_field, return_sql=True)
                     array_expr = when(
@@ -90,7 +102,7 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
         elif isinstance(field_type, MapType):
             if isinstance(existing_field, StructField) and isinstance(existing_field.dataType, MapType):
                 if isinstance(field_type.valueType, StructType):
-                    value_field = StructField("_val", field_type.valueType, True)  # Temporary name for schema processing
+                    value_field = StructField("_val", field_type.valueType, True)
                     existing_value_field = StructField("_val", existing_field.dataType.valueType, True) if isinstance(existing_field.dataType.valueType, StructType) else None
                     _, value_sql = get_field_expr(value_field, "", existing_value_field, return_sql=True)
                     map_expr = when(
@@ -146,7 +158,7 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
 
 def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
     """
-    Normalizes nullability in a PySpark DataFrame based on the provided schema.
+    Normalizes nullability in a PySpark DataFrame based on the schema.
     For optional structs/maps/arrays with required nested fields, sets the entire
     field to NULL if all required nested fields are NULL.
     
