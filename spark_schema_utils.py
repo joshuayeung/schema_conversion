@@ -235,19 +235,18 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
             # Handle array elements recursively if they are structs
             if isinstance(field_type.elementType, StructType):
                 element_struct_type = field_type.elementType
-                element_exprs = []
+                element_fields = []
                 for subfield in element_struct_type.fields:
-                    # Use 'x' as the alias for the array element in the lambda
-                    subfield_expr = build_null_condition(
+                    subfield_result = build_null_condition(
                         subfield,
                         prefix="",
                         existing_field=subfield,
                         is_array_element=True
                     )
-                    element_exprs.append(subfield_expr.alias(subfield.name))
+                    element_fields.append((subfield.name, subfield_result))
                 transformed_elements = transform(
                     col_ref,
-                    lambda x: struct(*element_exprs)
+                    lambda x: struct(*[x[field_name] if isinstance(field_result, str) else field_result for field_name, field_result in element_fields])
                 )
             else:
                 transformed_elements = col_ref
@@ -341,6 +340,9 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
             return map_expr.alias(field_name) if not is_array_element else map_expr
             
         else:
+            # For array element fields, return field name to be used in lambda
+            if is_array_element:
+                return field_name
             return col(field_name).alias(field_name) if field_name and not is_array_element else col(field_name)
     
     existing_columns = {f.name: f for f in df.schema.fields}
