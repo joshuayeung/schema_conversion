@@ -1,7 +1,7 @@
 from typing import Optional, Any
 from pyspark.sql import DataFrame
 from pyspark.sql.types import StructType, StructField, ArrayType, MapType
-from pyspark.sql.functions import lit, col, struct, array, map_from_arrays, when, size, map_keys, expr, explode_outer, collect_list
+from pyspark.sql.functions import lit, col, struct, array, map_from_arrays, when, size, map_keys, expr, explode_outer, collect_list, coalesce
 
 def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
     """
@@ -198,8 +198,8 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
         else:
             return col_expr.isNull()
     
-    def normalize_struct(field: StructField, col_expr: Any, prefix: str = "") -> Any:
-        """Normalize a struct field, setting to NULL if all fields are empty."""
+    def normalize_struct(current_df: DataFrame, field: StructField, col_expr: Any, prefix: str = "") -> tuple[DataFrame, Any]:
+        """Normalize a struct field, setting to NULL if all fields are empty, returning updated DataFrame and expression."""
         field_type = field.dataType
         field_name = f"{prefix}{field.name}" if prefix else field.name
         
@@ -207,7 +207,7 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
             subfield_exprs = []
             conditions = []
             for subfield in field_type.fields:
-                subfield_expr = normalize_struct(subfield, col_expr[subfield.name], "")
+                current_df, subfield_expr = normalize_struct(current_df, subfield, col_expr[subfield.name], f"{field_name}.")
                 subfield_exprs.append(subfield_expr.alias(subfield.name))
                 conditions.append(is_field_empty(col(f"{field_name}.{subfield.name}"), subfield.dataType))
             
@@ -216,32 +216,39 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
                 combined_condition = combined_condition & cond
             
             if field.nullable:
-                return when(
+                struct_expr = when(
                     combined_condition,
                     lit(None)
                 ).otherwise(
                     struct(*subfield_exprs)
                 ).alias(field_name)
-            return struct(*subfield_exprs).alias(field_name)
+            else:
+                struct_expr = struct(*subfield_exprs).alias(field_name)
+            
+            return current_df, struct_expr
         
         elif isinstance(field_type, ArrayType):
             # Explode array and normalize elements
             element_type = field_type.elementType
             temp_col = f"_elem_{field_name.replace('.', '_')}"
-            exploded_df = df.select(
+            exploded_df = current_df.select(
                 "*",
                 explode_outer(col(field_name)).alias(temp_col)
-            ).withColumn(
-                f"_norm_{temp_col}",
-                normalize_struct(
-                    StructField(temp_col, element_type, True),
-                    col(temp_col),
-                    ""
-                )
             )
             
+            # Normalize array elements
+            exploded_df, norm_expr = normalize_struct(
+                exploded_df,
+                StructField(temp_col, element_type, True),
+                col(temp_col),
+                ""
+            )
+            
+            # Add normalized elements
+            exploded_df = exploded_df.withColumn(f"_norm_{temp_col}", norm_expr)
+            
             # Aggregate back to array
-            group_cols = [c for c in df.columns if c != field_name]
+            group_cols = [c for c in current_df.columns if c != field_name]
             agg_df = exploded_df.groupBy(*group_cols).agg(
                 collect_list(f"_norm_{temp_col}").alias("_temp_array")
             )
@@ -283,20 +290,20 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
                         array_expr
                     )
             
-            # Update DataFrame
-            global df
-            df = agg_df.withColumn(field_name, array_expr).drop("_temp_array")
-            return col(field_name).alias(field_name)
+            # Update DataFrame with normalized array
+            result_df = agg_df.withColumn(field_name, array_expr).drop("_temp_array")
+            return result_df, col(field_name).alias(field_name)
         
         elif isinstance(field_type, MapType):
             if isinstance(field_type.valueType, StructType):
                 value_field = StructField("_val", field_type.valueType, True)
+                _, value_expr = normalize_struct(current_df, value_field, col("_val"), "")
                 map_expr = when(
                     col(field_name).isNotNull(),
                     expr(f"""
                         TRANSFORM_VALUES(
                             COALESCE({field_name}, MAP()),
-                            (k, v) -> {normalize_struct(value_field, col('v'), '').cast(field_type.valueType).sql_expr()}
+                            (k, v) -> {value_expr.cast(field_type.valueType).sql_expr()}
                         )
                     """)
                 ).otherwise(
@@ -306,21 +313,24 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
                 map_expr = col(field_name)
             
             if field.nullable:
-                return when(
+                map_expr = when(
                     col(field_name).isNull() | (size(map_keys(col(field_name))) == 0),
                     lit(None)
                 ).otherwise(
                     map_expr
                 ).alias(field_name)
-            return map_expr.alias(field_name)
+            else:
+                map_expr = map_expr.alias(field_name)
+            
+            return current_df, map_expr
         
         else:
-            return col(field_name).alias(field_name)
+            return current_df, col(field_name).alias(field_name)
     
-    # Create a copy of the input DataFrame to avoid modifying the original
+    # Process each top-level field
     result_df = df
     for field in schema.fields:
-        field_expr = normalize_struct(field, col(field.name), "")
+        result_df, field_expr = normalize_struct(result_df, field, col(field.name), "")
         result_df = result_df.withColumn(field.name, field_expr)
     
     return result_df
