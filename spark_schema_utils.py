@@ -172,7 +172,7 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
 def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
     """
     Normalizes nullability in a PySpark DataFrame based on the schema.
-    For optional structs/maps with required nested fields, sets the entire field to NULL if all required fields are NULL.
+    For optional structs/maps with required nested fields, sets the entire field to NULL if all required fields are NULL or empty.
     For optional arrays, sets to NULL if empty or NULL. For non-nullable arrays, sets to NULL if empty, NULL, or all required nested fields are NULL.
     Recursively normalizes nested arrays and structs at any level.
     
@@ -183,6 +183,21 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
     Returns:
         DataFrame with normalized NULL values for nested structures
     """
+    def is_field_empty(col_expr: Any, field_type: Any) -> Any:
+        """Check if a field is effectively empty (NULL, empty array, or struct with all fields empty)."""
+        if isinstance(field_type, StructType):
+            conditions = []
+            for subfield in field_type.fields:
+                subfield_col = col_expr[subfield.name]
+                conditions.append(is_field_empty(subfield_col, subfield.dataType))
+            return coalesce(*conditions, lit(True))
+        elif isinstance(field_type, ArrayType):
+            return col_expr.isNull() | (size(col_expr) == 0)
+        elif isinstance(field_type, MapType):
+            return col_expr.isNull() | (size(map_keys(col_expr)) == 0)
+        else:
+            return col_expr.isNull()
+    
     def build_null_condition(field: StructField, prefix: str = "", existing_field: Optional[StructField] = None, is_array_element: bool = False) -> Any:
         """Build condition to check if a field should be set to NULL, recursively handling nested structures."""
         field_type = field.dataType
@@ -207,12 +222,10 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
                 )
                 subfield_expr = subfield_expr.alias(subfield.name)
                 subfield_exprs.append(subfield_expr)
-                if not subfield.nullable:
-                    conditions.append(col(f"{subfield_prefix}{subfield.name}").isNull())
+                # Check if subfield is empty (NULL, empty array, or empty struct)
+                conditions.append(is_field_empty(col(f"{subfield_prefix}{subfield.name}"), subfield.dataType))
             
-            if not required_fields:
-                return col(field_name).alias(field_name) if field_name and not is_array_element else struct(*subfield_exprs)
-            
+            # Struct is empty if all fields (not just required) are empty
             combined_condition = conditions[0] if conditions else lit(True)
             for cond in conditions[1:]:
                 combined_condition = combined_condition & cond
@@ -246,7 +259,12 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
                     element_fields.append((subfield.name, subfield_result))
                 transformed_elements = transform(
                     col_ref,
-                    lambda x: struct(*[x[field_name] if isinstance(field_result, str) else field_result for field_name, field_result in element_fields])
+                    lambda x: when(
+                        is_field_empty(struct(*[x[field_name] if isinstance(field_result, str) else field_result for field_name, field_result in element_fields]), element_struct_type),
+                        lit(None)
+                    ).otherwise(
+                        struct(*[x[field_name] if isinstance(field_result, str) else field_result for field_name, field_result in element_fields])
+                    )
                 )
             else:
                 transformed_elements = col_ref
@@ -279,18 +297,20 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
                             lambda x: x[req_field.name].isNotNull()
                         )
                         conditions.append(size(non_null_elements) == 0)
+                    # Add check for empty array
+                    conditions.append(col_ref.isNull() | (size(col_ref) == 0))
                     
                     combined_condition = conditions[0] if conditions else lit(True)
                     for cond in conditions[1:]:
                         combined_condition = combined_condition & cond
                     
                     return when(
-                        col_ref.isNull() | (size(col_ref) == 0) | combined_condition,
+                        combined_condition,
                         lit(None)
                     ).otherwise(
                         transformed_elements
                     ).alias(field_name) if not is_array_element else when(
-                        col_ref.isNull() | (size(col_ref) == 0) | combined_condition,
+                        combined_condition,
                         lit(None)
                     ).otherwise(
                         transformed_elements
