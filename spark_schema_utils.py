@@ -28,29 +28,15 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
             for subfield in field_type.fields:
                 existing_subfield = existing_subfields.get(subfield.name)
                 subfield_prefix = f"{field_name}." if field_name else ""
-                if existing_subfield and isinstance(existing_field, StructField) and not isinstance(subfield.dataType, StructType):
-                    # For non-struct subfields, use existing column if available
-                    subfield_expr = col(f"{field_name}.{subfield.name}")
-                    subfield_sql = f"{field_name}.{subfield.name}"
-                    if isinstance(subfield.dataType, (ArrayType, MapType)):
-                        nested_expr, nested_sql = get_field_expr(
-                            subfield,
-                            subfield_prefix,
-                            existing_subfield,
-                            return_sql=True
-                        )
-                        subfield_expr = nested_expr
-                        subfield_sql = nested_sql
-                else:
-                    # For structs or missing fields, recursively generate expression
-                    nested_expr, nested_sql = get_field_expr(
-                        subfield,
-                        subfield_prefix,
-                        existing_subfield,
-                        return_sql=True
-                    )
-                    subfield_expr = nested_expr
-                    subfield_sql = nested_sql
+                # Always recursively process subfields to ensure all nested fields are included
+                nested_expr, nested_sql = get_field_expr(
+                    subfield,
+                    subfield_prefix,
+                    existing_subfield,
+                    return_sql=True
+                )
+                subfield_expr = nested_expr
+                subfield_sql = nested_sql
                 subfield_expr = subfield_expr.alias(subfield.name)
                 subfield_sqls.append(f"{subfield_sql} AS {subfield.name}")
             
