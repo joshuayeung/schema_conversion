@@ -1,7 +1,7 @@
 from typing import Optional, Any
 from pyspark.sql import DataFrame
 from pyspark.sql.types import StructType, StructField, ArrayType, MapType
-from pyspark.sql.functions import lit, col, struct, array, map_from_arrays, when, size, map_keys, expr, explode_outer, collect_list, coalesce
+from pyspark.sql.functions import lit, col, struct, array, map_from_arrays, when, size, map_keys, expr, explode_outer, collect_list, coalesce, first
 
 def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
     """
@@ -247,11 +247,22 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
             # Add normalized elements
             exploded_df = exploded_df.withColumn(f"_norm_{temp_col}", norm_expr)
             
-            # Aggregate back to array
-            group_cols = [c for c in current_df.columns if c != field_name]
-            agg_df = exploded_df.groupBy(*group_cols).agg(
-                collect_list(f"_norm_{temp_col}").alias("_temp_array")
-            )
+            # Determine orderable columns for groupBy
+            orderable_cols = [
+                c for c in current_df.columns
+                if c != field_name and not isinstance(current_df.schema[c].dataType, MapType)
+            ]
+            non_orderable_cols = [
+                c for c in current_df.columns
+                if c != field_name and isinstance(current_df.schema[c].dataType, MapType)
+            ]
+            
+            # Aggregate back to array, preserving non-orderable columns
+            agg_exprs = [collect_list(f"_norm_{temp_col}").alias("_temp_array")]
+            for non_orderable in non_orderable_cols:
+                agg_exprs.append(first(non_orderable, ignorenulls=True).alias(non_orderable))
+            
+            agg_df = exploded_df.groupBy(*orderable_cols).agg(*agg_exprs)
             
             # Normalize array based on nullability
             array_expr = col("_temp_array")
@@ -297,7 +308,7 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
         elif isinstance(field_type, MapType):
             if isinstance(field_type.valueType, StructType):
                 value_field = StructField("_val", field_type.valueType, True)
-                _, value_expr = normalize_struct(current_df, value_field, col("_val"), "")
+                current_df, value_expr = normalize_struct(current_df, value_field, col("_val"), "")
                 map_expr = when(
                     col(field_name).isNotNull(),
                     expr(f"""
