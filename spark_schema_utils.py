@@ -28,10 +28,11 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
             for subfield in field_type.fields:
                 existing_subfield = existing_subfields.get(subfield.name)
                 subfield_prefix = f"{field_name}." if field_name else ""
-                if existing_subfield and isinstance(existing_field, StructField):
+                if existing_subfield and isinstance(existing_field, StructField) and not isinstance(subfield.dataType, StructType):
+                    # For non-struct subfields, use existing column if available
                     subfield_expr = col(f"{field_name}.{subfield.name}")
                     subfield_sql = f"{field_name}.{subfield.name}"
-                    if isinstance(subfield.dataType, (StructType, ArrayType, MapType)):
+                    if isinstance(subfield.dataType, (ArrayType, MapType)):
                         nested_expr, nested_sql = get_field_expr(
                             subfield,
                             subfield_prefix,
@@ -41,12 +42,15 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
                         subfield_expr = nested_expr
                         subfield_sql = nested_sql
                 else:
-                    subfield_expr, subfield_sql = get_field_expr(
+                    # For structs or missing fields, recursively generate expression
+                    nested_expr, nested_sql = get_field_expr(
                         subfield,
                         subfield_prefix,
-                        None,
+                        existing_subfield,
                         return_sql=True
                     )
+                    subfield_expr = nested_expr
+                    subfield_sql = nested_sql
                 subfield_expr = subfield_expr.alias(subfield.name)
                 subfield_sqls.append(f"{subfield_sql} AS {subfield.name}")
             
@@ -72,26 +76,21 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
                 if isinstance(field_type.elementType, StructType):
                     element_field = StructField("_elem", field_type.elementType, True)
                     existing_element_field = StructField("_elem", existing_field.dataType.elementType, True) if isinstance(existing_field.dataType.elementType, StructType) else None
-                    # Build struct SQL explicitly for array elements
                     element_struct_type = field_type.elementType
                     existing_element_struct = existing_element_field.dataType if existing_element_field else None
                     existing_element_subfields = {f.name: f for f in existing_element_struct.fields} if existing_element_struct else {}
                     element_sql_parts = []
-                    for subfield in element_struct_type.fields:
-                        if subfield.name in existing_element_subfields:
-                            element_sql_parts.append(f"_elem.{subfield.name} AS {subfield.name}")
-                        else:
-                            subfield_expr, subfield_sql = get_field_expr(subfield, "", None, return_sql=True)
-                            element_sql_parts.append(f"{subfield_sql} AS {subfield.name}")
-                    element_sql = f"STRUCT({', '.join(element_sql_parts)})"
-                    # Build column expression for array
                     element_exprs = []
                     for subfield in element_struct_type.fields:
                         if subfield.name in existing_element_subfields:
+                            element_sql_parts.append(f"_elem.{subfield.name} AS {subfield.name}")
                             element_expr = col(f"_elem.{subfield.name}")
                         else:
-                            element_expr, _ = get_field_expr(subfield, "", None, return_sql=True)
+                            subfield_expr, subfield_sql = get_field_expr(subfield, "", None, return_sql=True)
+                            element_sql_parts.append(f"{subfield_sql} AS {subfield.name}")
+                            element_expr = subfield_expr
                         element_exprs.append(element_expr.alias(subfield.name))
+                    element_sql = f"STRUCT({', '.join(element_sql_parts)})"
                     element_expr = struct(*element_exprs)
                     array_expr = when(
                         col(field_name).isNotNull(),
