@@ -1,6 +1,6 @@
 from pyspark.sql import DataFrame
 from pyspark.sql.types import StructType, StructField, ArrayType, MapType
-from pyspark.sql.functions import lit, col, struct, array, map_from_arrays, when, coalesce, expr, size
+from pyspark.sql.functions import lit, col, struct, array, map_from_arrays, when, coalesce, expr, size, array_filter, array_distinct
 
 def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
     """
@@ -28,7 +28,6 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
             for subfield in field_type.fields:
                 existing_subfield = existing_subfields.get(subfield.name)
                 subfield_prefix = f"{field_name}." if field_name else ""
-                # Always recursively process subfields to ensure all nested fields are included
                 nested_expr, nested_sql = get_field_expr(
                     subfield,
                     subfield_prefix,
@@ -38,6 +37,7 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
                 subfield_expr = nested_expr
                 subfield_sql = nested_sql
                 subfield_expr = subfield_expr.alias(subfield.name)
+                subfield_exprs.append(subfield_expr)
                 subfield_sqls.append(f"{subfield_sql} AS {subfield.name}")
             
             if not subfield_exprs:  # Handle empty struct
@@ -172,7 +172,8 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
     """
     Normalizes nullability in a PySpark DataFrame based on the schema.
     For optional structs/maps/arrays with required nested fields, sets the entire
-    field to NULL if all required nested fields are NULL.
+    field to NULL if all required nested fields are NULL. For arrays (nullable or not),
+    sets the field to NULL if empty or if all required nested fields are NULL.
     
     Args:
         df: Input PySpark DataFrame
@@ -222,14 +223,42 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
             return struct(*subfield_exprs).alias(field_name)
                 
         elif isinstance(field_type, ArrayType):
-            if field.nullable:
+            # Handle arrays with required nested fields
+            required_fields = []
+            if isinstance(field_type.elementType, StructType):
+                required_fields = [f for f in field_type.elementType.fields if not f.nullable]
+            
+            if required_fields:
+                # Check if all elements have NULL required fields
+                conditions = []
+                for req_field in required_fields:
+                    # Filter elements where the required field is non-NULL
+                    non_null_elements = array_filter(
+                        col(field_name),
+                        lambda x: x[req_field.name].isNotNull()
+                    )
+                    # If no elements have non-NULL required field, condition is true
+                    conditions.append(size(non_null_elements) == 0)
+                
+                combined_condition = conditions[0] if conditions else lit(True)
+                for cond in conditions[1:]:
+                    combined_condition = combined_condition & cond
+                
+                # Set to NULL if array is NULL, empty, or all required fields are NULL
                 return when(
-                    col(field_name).isNull() | (size(col(field_name)) == 0),
+                    col(field_name).isNull() | (size(col(field_name)) == 0) | combined_condition,
                     lit(None)
                 ).otherwise(
                     col(field_name)
                 ).alias(field_name)
-            return col(field_name).alias(field_name)
+            
+            # For arrays without required fields, set to NULL if NULL or empty
+            return when(
+                col(field_name).isNull() | (size(col(field_name)) == 0),
+                lit(None)
+            ).otherwise(
+                col(field_name)
+            ).alias(field_name)
             
         elif isinstance(field_type, MapType):
             if field.nullable:
