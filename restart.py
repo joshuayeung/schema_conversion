@@ -3,7 +3,7 @@ from pyspark.sql.functions import col, struct, lit, transform, array, when, coal
 from pyspark.sql.types import StructType, StructField, StringType, IntegerType, ArrayType
 
 # Initialize Spark session
-spark = SparkSession.builder.appName("AddMissingFieldsWithArraysFixed").getOrCreate()
+spark = SparkSession.builder.appName("AddMissingFieldsWithArraysCorrected").getOrCreate()
 
 # Sample DataFrame with nested structs and arrays
 data = [
@@ -53,19 +53,19 @@ print("Original DataFrame:")
 df.show(truncate=False)
 df.printSchema()
 
-def get_field_names(schema, prefix=""):
+def get_field_names(schema, prefix="", in_array=False):
     """Extract all field names from a schema, including nested structs and arrays."""
     fields = []
     for field in schema.fields:
-        full_path = f"{prefix}.{field.name}" if prefix else field.name
+        full_path = f"{prefix}.{field.name}" if prefix and not in_array else field.name
         fields.append(full_path)
         if isinstance(field.dataType, StructType):
-            fields.extend(get_field_names(field.dataType, full_path))
+            fields.extend(get_field_names(field.dataType, full_path, in_array))
         elif isinstance(field.dataType, ArrayType) and isinstance(field.dataType.elementType, StructType):
-            fields.extend(get_field_names(field.dataType.elementType, full_path))
+            fields.extend(get_field_names(field.dataType.elementType, full_path, in_array=True))
     return fields
 
-def build_struct_expr(target_schema, df_schema, prefix="", is_array_element=False):
+def build_struct_expr(target_schema, df_schema, prefix="", is_array_element=False, lambda_var=None):
     """
     Build a struct expression for a schema, using existing fields from df_schema
     and nulls for missing fields. Handles structs within arrays.
@@ -75,6 +75,7 @@ def build_struct_expr(target_schema, df_schema, prefix="", is_array_element=Fals
         df_schema: Current DataFrame schema for the struct
         prefix: Column prefix (e.g., 'info.details')
         is_array_element: True if processing a struct within an array
+        lambda_var: Lambda variable (e.g., 'x') for array transforms
     
     Returns:
         Struct expression with all fields from target_schema
@@ -82,7 +83,7 @@ def build_struct_expr(target_schema, df_schema, prefix="", is_array_element=Fals
     from pyspark.sql.types import StructType, ArrayType
 
     # Get field names from DataFrame schema
-    df_field_names = get_field_names(df_schema) if isinstance(df_schema, StructType) else []
+    df_field_names = get_field_names(df_schema, in_array=is_array_element) if isinstance(df_schema, StructType) else []
     
     fields = []
     for field in target_schema.fields:
@@ -90,7 +91,11 @@ def build_struct_expr(target_schema, df_schema, prefix="", is_array_element=Fals
         if isinstance(field.dataType, StructType):
             # Recurse into nested struct
             sub_df_schema = next((f.dataType for f in df_schema.fields if f.name == field.name), StructType([]))
-            fields.append(build_struct_expr(field.dataType, sub_df_schema, full_path).alias(field.name))
+            if is_array_element and lambda_var is not None:
+                # For nested structs in arrays, pass lambda_var
+                fields.append(build_struct_expr(field.dataType, sub_df_schema, "", is_array_element=True, lambda_var=lambda_var).alias(field.name))
+            else:
+                fields.append(build_struct_expr(field.dataType, sub_df_schema, full_path).alias(field.name))
         elif isinstance(field.dataType, ArrayType) and isinstance(field.dataType.elementType, StructType):
             # Handle array of structs
             sub_df_schema = next((f.dataType.elementType for f in df_schema.fields if f.name == field.name), StructType([]))
@@ -100,16 +105,21 @@ def build_struct_expr(target_schema, df_schema, prefix="", is_array_element=Fals
                     array_col.isNotNull(),
                     transform(
                         coalesce(array_col, array(lit(None).cast(field.dataType.elementType))),
-                        lambda x: build_struct_expr(field.dataType.elementType, sub_df_schema, "", is_array_element=True)
+                        lambda x: build_struct_expr(field.dataType.elementType, sub_df_schema, "", is_array_element=True, lambda_var=x)
                     )
                 ).otherwise(lit(None).cast(field.dataType)).alias(field.name)
             )
         else:
             # Use existing field if available, otherwise use null
-            if full_path in df_field_names or field.name in [f.name for f in df_schema.fields]:
-                fields.append(col(full_path).alias(field.name))
+            if is_array_element and lambda_var is not None:
+                # For array elements, use lambda_var.field_name
+                field_ref = getattr(lambda_var, field.name) if field.name in [f.name for f in df_schema.fields] else lit(None).cast(field.dataType)
+                fields.append(field_ref.alias(field.name))
             else:
-                fields.append(lit(None).cast(field.dataType).alias(field.name))
+                if full_path in df_field_names or field.name in [f.name for f in df_schema.fields]:
+                    fields.append(col(full_path).alias(field.name))
+                else:
+                    fields.append(lit(None).cast(field.dataType).alias(field.name))
     return struct(*fields)
 
 def align_dataframe_to_schema(df, target_schema):
@@ -158,7 +168,7 @@ def align_dataframe_to_schema(df, target_schema):
                     col(field.name).isNotNull(),
                     transform(
                         coalesce(col(field.name), array(lit(None).cast(field.dataType.elementType))),
-                        lambda x: build_struct_expr(field.dataType.elementType, df_sub_schema, "", is_array_element=True)
+                        lambda x: build_struct_expr(field.dataType.elementType, df_sub_schema, "", is_array_element=True, lambda_var=x)
                     )
                 ).otherwise(lit(None).cast(field.dataType)).alias(field.name)
             )
