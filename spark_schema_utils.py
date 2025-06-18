@@ -1,7 +1,7 @@
 from typing import Optional, Any, Dict, List
 from pyspark.sql import DataFrame
 from pyspark.sql.types import StructType, StructField, ArrayType, MapType, DataType
-from pyspark.sql.functions import lit, col, struct, array, map_from_arrays, when, size, map_keys, expr, explode_outer, collect_list, coalesce, first
+from pyspark.sql.functions import lit, col, struct, array, map_from_arrays, when, size, map_keys, expr, explode_outer, collect_list, coalesce
 
 def get_column_paths(schema: StructType, prefix: str = "") -> Dict[str, str]:
     """
@@ -12,12 +12,11 @@ def get_column_paths(schema: StructType, prefix: str = "") -> Dict[str, str]:
         prefix: Current path prefix
     
     Returns:
-        Dict mapping full paths to unique aliases (e.g., {"otherStruct.chineseName": "otherStruct_chineseName"})
+        Dict mapping full paths to unique aliases
     """
     path_to_alias = {}
     for field in schema.fields:
         field_name = f"{prefix}{field.name}" if prefix else field.name
-        # Create unique alias by replacing dots with underscores
         alias = field_name.replace(".", "_")
         path_to_alias[field_name] = alias
         
@@ -37,8 +36,6 @@ def get_column_paths(schema: StructType, prefix: str = "") -> Dict[str, str]:
             nested_paths = get_column_paths(field.dataType.valueType, f"{field_name}.value.")
             path_to_alias.update(nested_paths)
     
-    # Debug: Log path mappings
-    # print(f"Path to alias: {path_to_alias}")
     return path_to_alias
 
 def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
@@ -78,7 +75,7 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
                 subfield_exprs.append(subfield_expr)
                 subfield_sqls.append(f"{subfield_sql} AS {subfield.name}")
             
-            if not subfield_exprs:  # Handle empty struct
+            if not subfield_exprs:
                 if isinstance(existing_field, StructField):
                     col_expr = col(field_name)
                     sql = field_name
@@ -267,30 +264,13 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
             return current_df, struct_expr
         
         elif isinstance(field_type, ArrayType):
-            # Explode array and normalize elements
             element_type = field_type.elementType
             temp_col = f"_elem_{field_name.replace('.', '_')}"
             
-            # Select top-level columns, preserving complex fields
-            select_cols = []
-            alias_to_path = {}
-            for c in current_df.schema.fields:
-                if c.name != field_name:
-                    select_cols.append(col(c.name).alias(c.name))
-                    alias_to_path[c.name] = c.name
-            
-            # Debug: Print schema before explode
-            # print(f"Before explode for {field_name}:")
-            # current_df.printSchema()
-            
+            # Explode array
             exploded_df = current_df.select(
-                *select_cols,
                 explode_outer(col(field_name)).alias(temp_col)
             )
-            
-            # Debug: Print schema after explode
-            # print(f"After explode for {field_name}:")
-            # exploded_df.printSchema()
             
             # Normalize array elements
             exploded_df, norm_expr = normalize_struct(
@@ -300,28 +280,12 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
                 ""
             )
             
-            # Add normalized elements
             exploded_df = exploded_df.withColumn(f"_norm_{temp_col}", norm_expr)
             
-            # Determine orderable columns for groupBy
-            orderable_cols = [
-                col(c).alias(alias_to_path[c]) for c in exploded_df.columns
-                if c != temp_col and c != f"_norm_{temp_col}" and
-                not isinstance(exploded_df.schema[c].dataType, MapType)
-            ]
-            
-            non_orderable_cols = [
-                c for c in exploded_df.columns
-                if c != temp_col and c != f"_norm_{temp_col}" and
-                isinstance(exploded_df.schema[c].dataType, MapType)
-            ]
-            
-            # Aggregate back to array, preserving all columns
-            agg_exprs = [collect_list(f"_norm_{temp_col}").alias("_temp_array")]
-            for col_name in non_orderable_cols + [c for c in exploded_df.columns if c != temp_col and c != f"_norm_{temp_col}" and c not in non_orderable_cols]:
-                agg_exprs.append(first(col_name, ignorenulls=True).alias(alias_to_path.get(col_name, col_name)))
-            
-            agg_df = exploded_df.groupBy(*orderable_cols).agg(*agg_exprs)
+            # Aggregate normalized elements
+            agg_df = exploded_df.groupBy().agg(
+                collect_list(f"_norm_{temp_col}").alias("_temp_array")
+            )
             
             # Normalize array based on nullability
             array_expr = col("_temp_array")
@@ -338,12 +302,10 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
                     array().cast(field_type)
                 )
             
-            # Update DataFrame with normalized array
-            result_df = agg_df.withColumn(field_name, array_expr).drop("_temp_array")
-            
-            # Debug: Print schema after aggregation
-            # print(f"After aggregation for {field_name}:")
-            # result_df.printSchema()
+            # Rejoin with original DataFrame to preserve other columns
+            result_df = current_df.drop(field_name).crossJoin(
+                agg_df.select(array_expr.alias(field_name))
+            ).drop("_temp_array")
             
             return result_df, col(field_name).alias(field_name)
         
@@ -380,14 +342,13 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
         else:
             return current_df, col(field_name).alias(field_name)
     
-    # Process all fields simultaneously to avoid logical plan issues
+    # Process all fields in a single select
     result_df = df
     field_exprs = []
     for field in schema.fields:
         _, field_expr = normalize_struct(result_df, field, col(field.name), "")
         field_exprs.append(field_expr.alias(field.name))
     
-    # Apply all transformations in a single select
     result_df = result_df.select(*field_exprs)
     
     # Debug: Print final schema and logical plan
