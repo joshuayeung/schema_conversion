@@ -3,39 +3,43 @@ from pyspark.sql import DataFrame
 from pyspark.sql.types import StructType, StructField, ArrayType, MapType, DataType
 from pyspark.sql.functions import lit, col, struct, array, map_from_arrays, when, size, map_keys, expr, explode_outer, collect_list, coalesce, first
 
-def get_column_paths(schema: StructType, prefix: str = "") -> Dict[str, List[str]]:
+def get_column_paths(schema: StructType, prefix: str = "") -> Dict[str, str]:
     """
-    Traverses schema to map column names to their full paths, identifying duplicates.
+    Traverses schema to map full column paths to unique aliases for all fields.
     
     Args:
         schema: Schema to traverse
         prefix: Current path prefix
     
     Returns:
-        Dict mapping column names to list of full paths (e.g., {"findings": ["findings", "otherStruct.findings"]})
+        Dict mapping full paths to unique aliases (e.g., {"otherStruct.chineseName": "otherStruct_chineseName"})
     """
-    column_paths = {}
+    path_to_alias = {}
     for field in schema.fields:
         field_name = f"{prefix}{field.name}" if prefix else field.name
-        if field_name not in column_paths:
-            column_paths[field_name] = []
-        column_paths[field_name].append(field_name)
+        # Create unique alias by replacing dots with underscores
+        alias = field_name.replace(".", "_")
+        path_to_alias[field_name] = alias
         
         if isinstance(field.dataType, StructType):
             nested_paths = get_column_paths(field.dataType, f"{field_name}.")
-            for name, paths in nested_paths.items():
-                if name not in column_paths:
-                    column_paths[name] = []
-                column_paths[name].extend(paths)
-        elif isinstance(field.dataType, ArrayType) and isinstance(field.dataType.elementType, StructType):
-            nested_paths = get_column_paths(field.dataType.elementType, f"{field_name}.")
-            for name, paths in nested_paths.items():
-                if name not in column_paths:
-                    column_paths[name] = []
-                column_paths[name].extend(paths)
+            path_to_alias.update(nested_paths)
+        elif isinstance(field.dataType, ArrayType):
+            current_type = field.dataType
+            current_prefix = f"{field_name}."
+            while isinstance(current_type, ArrayType):
+                if isinstance(current_type.elementType, StructType):
+                    nested_paths = get_column_paths(current_type.elementType, current_prefix)
+                    path_to_alias.update(nested_paths)
+                current_type = current_type.elementType
+                current_prefix += "element."
+        elif isinstance(field.dataType, MapType) and isinstance(field.dataType.valueType, StructType):
+            nested_paths = get_column_paths(field.dataType.valueType, f"{field_name}.value.")
+            path_to_alias.update(nested_paths)
     
-    # Filter to names with multiple paths (duplicates)
-    return {k: v for k, v in column_paths.items() if len(v) > 1 or k in [f.name for f in schema.fields]}
+    # Debug: Log path mappings
+    # print(f"Path to alias: {path_to_alias}")
+    return path_to_alias
 
 def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
     """
@@ -50,7 +54,6 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
         DataFrame with all columns and nested subfields from the schema, missing ones added as NULL
     """
     def get_field_expr(field: StructField, prefix: str = "", existing_field: Optional[StructField] = None, return_sql: bool = False) -> Any:
-        """Generate expression for a field, handling nested structures and existing fields."""
         field_type = field.dataType
         field_name = f"{prefix}{field.name}" if prefix else field.name
         
@@ -268,27 +271,36 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
             element_type = field_type.elementType
             temp_col = f"_elem_{field_name.replace('.', '_')}"
             
-            # Get duplicate column names from schema
-            duplicate_columns = get_column_paths(current_df.schema)
+            # Get path-to-alias mappings for all fields in schema
+            path_to_alias = get_column_paths(current_df.schema)
             
-            # Select top-level columns with unique aliases for duplicates
+            # Select columns with fully qualified paths or unique aliases
             select_cols = []
-            alias_map = {}  # Maps original name to alias
-            for c in current_df.columns:
-                if c != field_name:
-                    if c in duplicate_columns and len(duplicate_columns[c]) > 1:
-                        # Create unique alias (e.g., findings -> top_level_findings)
-                        alias = f"{c}_{c.replace('.', '_')}_alias"
-                        select_cols.append(col(c).alias(alias))
-                        alias_map[alias] = c
+            alias_to_path = {}  # Maps alias back to full path
+            for c in current_df.schema.fields:
+                if c.name != field_name:
+                    full_path = c.name
+                    # If field is a struct or array, include its subfields
+                    if isinstance(c.dataType, (StructType, ArrayType)):
+                        sub_paths = get_column_paths(c.dataType, f"{c.name}.")
+                        for sub_path, alias in sub_paths.items():
+                            select_cols.append(col(sub_path).alias(alias))
+                            alias_to_path[alias] = sub_path
                     else:
-                        select_cols.append(col(c).alias(c))
-                        alias_map[c] = c
+                        alias = path_to_alias.get(full_path, full_path.replace(".", "_"))
+                        select_cols.append(col(full_path).alias(alias))
+                        alias_to_path[alias] = full_path
+            
+            # Debug: Print schema before explode
+            # current_df.printSchema()
             
             exploded_df = current_df.select(
                 *select_cols,
                 explode_outer(col(field_name)).alias(temp_col)
             )
+            
+            # Debug: Print schema after explode
+            # exploded_df.printSchema()
             
             # Normalize array elements
             exploded_df, norm_expr = normalize_struct(
@@ -303,7 +315,7 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
             
             # Determine orderable columns for groupBy
             orderable_cols = [
-                col(c).alias(alias_map[c]) for c in exploded_df.columns
+                col(c).alias(alias_to_path[c]) for c in exploded_df.columns
                 if c != temp_col and c != f"_norm_{temp_col}" and
                 not isinstance(exploded_df.schema[c].dataType, MapType)
             ]
@@ -317,10 +329,10 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
             # Aggregate back to array, preserving non-orderable and aliased columns
             agg_exprs = [collect_list(f"_norm_{temp_col}").alias("_temp_array")]
             for non_orderable in non_orderable_cols:
-                agg_exprs.append(first(non_orderable, ignorenulls=True).alias(alias_map.get(non_orderable, non_orderable)))
-            for alias, orig in alias_map.items():
+                agg_exprs.append(first(non_orderable, ignorenulls=True).alias(alias_to_path.get(non_orderable, non_orderable)))
+            for alias, orig_path in alias_to_path.items():
                 if alias in exploded_df.columns and alias not in non_orderable_cols:
-                    agg_exprs.append(first(alias, ignorenulls=True).alias(orig))
+                    agg_exprs.append(first(alias, ignorenulls=True).alias(orig_path))
             
             agg_df = exploded_df.groupBy(*orderable_cols).agg(*agg_exprs)
             
