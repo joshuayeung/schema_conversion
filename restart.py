@@ -44,63 +44,50 @@ print("Original DataFrame:")
 df.show(truncate=False)
 df.printSchema()
 
-def add_missing_fields(df, df_schema, target_schema, column_prefix=""):
+def get_field_names(schema):
+    """Extract all field names from a schema, including nested structs."""
+    fields = []
+    for field in schema.fields:
+        fields.append(field.name)
+        if isinstance(field.dataType, StructType):
+            nested_fields = get_field_names(field.dataType)
+            fields.extend(f"{field.name}.{subfield}" for subfield in nested_fields)
+    return fields
+
+def build_struct_expr(target_schema, df_schema, prefix=""):
     """
-    Recursively add missing fields from target_schema to df's nested structs.
+    Build a struct expression for a schema, using existing fields from df_schema
+    and nulls for missing fields.
     
     Args:
-        df: PySpark DataFrame
-        df_schema: Current schema of the DataFrame
-        target_schema: Target schema with additional fields
-        column_prefix: Prefix for nested column references (e.g., 'info.details')
+        target_schema: Target schema for the struct
+        df_schema: Current DataFrame schema for the struct
+        prefix: Column prefix (e.g., 'info.details')
     
     Returns:
-        Updated DataFrame with missing fields added
+        Struct expression with all fields from target_schema
     """
     from pyspark.sql.types import StructType
 
-    # If schemas are not StructType, return df unchanged (base case for non-struct types)
-    if not isinstance(df_schema, StructType) or not isinstance(target_schema, StructType):
-        return df
-
-    # Iterate through target schema fields
+    df_field_names = get_field_names(df_schema) if isinstance(df_schema, StructType) else []
+    fields = []
     for field in target_schema.fields:
-        # Full column path for the field
-        current_path = f"{column_prefix}.{field.name}" if column_prefix else field.name
-        
-        # Check if field exists in current DataFrame schema
-        df_field = None
-        for f in df_schema.fields:
-            if f.name == field.name:
-                df_field = f
-                break
-
-        if df_field is None:
-            # Field is missing; add it with null or default value
-            if isinstance(field.dataType, StructType):
-                # For missing structs, create a null struct with the target schema
-                df = df.withColumn(
-                    current_path,
-                    struct(*[lit(None).cast(subfield.dataType).alias(subfield.name) 
-                             for subfield in field.dataType.fields])
-                )
+        full_path = f"{prefix}.{field.name}" if prefix else field.name
+        if isinstance(field.dataType, StructType):
+            # Recurse into nested struct
+            sub_df_schema = next((f.dataType for f in df_schema.fields if f.name == field.name), StructType([]))
+            fields.append(build_struct_expr(field.dataType, sub_df_schema, full_path).alias(field.name))
+        else:
+            # Use existing field if available, otherwise use null
+            if full_path in df_field_names or field.name in [f.name for f in df_schema.fields]:
+                fields.append(col(full_path).alias(field.name))
             else:
-                # For non-struct types, add null or default value
-                df = df.withColumn(current_path, lit(None).cast(field.dataType))
-        elif isinstance(field.dataType, StructType):
-            # Field exists and is a struct; recurse into its fields
-            df = add_missing_fields(
-                df,
-                df_field.dataType,
-                field.dataType,
-                current_path
-            )
-
-    return df
+                fields.append(lit(None).cast(field.dataType).alias(field.name))
+    return struct(*fields)
 
 def align_dataframe_to_schema(df, target_schema):
     """
-    Align DataFrame schema to target schema by adding missing fields.
+    Align DataFrame schema to target schema by adding missing fields recursively.
     
     Args:
         df: PySpark DataFrame
@@ -124,34 +111,14 @@ def align_dataframe_to_schema(df, target_schema):
                 df_updated = df_updated.withColumn(
                     field.name, lit(None).cast(field.dataType)
                 )
-        elif isinstance(field.dataType, StructType):
-            # Recurse into top-level struct fields
-            df_updated = add_missing_fields(
-                df_updated,
-                df.schema[field.name].dataType,
-                field.dataType,
-                field.name
-            )
-    
-    # Reconstruct the DataFrame with the target schema order
-    def build_struct_expr(schema, prefix=""):
-        """Helper to build struct expressions for nested fields"""
-        if not isinstance(schema, StructType):
-            return col(f"{prefix}") if prefix else None
-        fields = []
-        for field in schema.fields:
-            full_path = f"{prefix}.{field.name}" if prefix else field.name
-            if isinstance(field.dataType, StructType):
-                fields.append(build_struct_expr(field.dataType, full_path).alias(field.name))
-            else:
-                fields.append(col(full_path).alias(field.name))
-        return struct(*fields)
 
-    # Select columns in target schema order
+    # Build select expression to match target schema
     select_expr = []
     for field in target_schema.fields:
         if isinstance(field.dataType, StructType):
-            select_expr.append(build_struct_expr(field.dataType, field.name).alias(field.name))
+            # Get the sub-schema for the field from the DataFrame
+            df_sub_schema = next((f.dataType for f in df_updated.schema.fields if f.name == field.name), StructType([]))
+            select_expr.append(build_struct_expr(field.dataType, df_sub_schema, field.name).alias(field.name))
         else:
             select_expr.append(col(field.name))
     
