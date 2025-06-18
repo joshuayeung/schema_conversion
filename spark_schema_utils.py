@@ -29,33 +29,27 @@ def add_missing_columns(df: DataFrame, schema: StructType) -> DataFrame:
         elif isinstance(field_type, ArrayType):
             if existing_field and isinstance(existing_field.dataType, ArrayType):
                 if isinstance(field_type.elementType, StructType):
+                    existing_element_subfields = {f.name: f for f in existing_field.dataType.elementType.fields} if isinstance(existing_field.dataType.elementType, StructType) else {}
                     subfield_exprs = [
-                        get_field_expr(subfield, "_elem.").alias(subfield.name)
+                        col(f"elem.{subfield.name}").alias(subfield.name) if subfield.name in existing_element_subfields
+                        else lit(None).cast(subfield.dataType).alias(subfield.name)
                         for subfield in field_type.elementType.fields
                     ]
                     element_expr = struct(*subfield_exprs)
                     return when(
                         col(field_name).isNotNull(),
                         expr(f"""
-                            TRANSFORM(COALESCE({field_name}, ARRAY()), _elem -> {element_expr})
+                            TRANSFORM(COALESCE({field_name}, ARRAY()), elem -> {element_expr})
                         """)
                     ).otherwise(array().cast(field_type)).alias(field_name)
                 return col(field_name).alias(field_name)
             return array().cast(field_type).alias(field_name)
             
         elif isinstance(field_type, MapType):
-            if existing_field and isinstance(existing_field.dataType, MapType) and isinstance(field_type.valueType, StructType):
-                subfield_exprs = [
-                    get_field_expr(subfield, "v.").alias(subfield.name)
-                    for subfield in field_type.valueType.fields
-                ]
-                value_expr = struct(*subfield_exprs)
-                return when(
-                    col(field_name).isNotNull(),
-                    expr(f"""
-                        TRANSFORM_VALUES(COALESCE({field_name}, MAP()), (k, v) -> {value_expr})
-                    """)
-                ).otherwise(map_from_arrays(array(), array()).cast(field_type)).alias(field_name)
+            if existing_field and isinstance(existing_field.dataType, MapType):
+                if isinstance(field_type.valueType, StructType):
+                    return col(field_name).alias(field_name)  # Preserve existing map
+                return col(field_name).alias(field_name)
             return map_from_arrays(array(), array()).cast(field_type).alias(field_name)
             
         else:
