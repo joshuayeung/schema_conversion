@@ -1,9 +1,9 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, struct, lit, transform
+from pyspark.sql.functions import col, struct, lit, transform, array, when, coalesce
 from pyspark.sql.types import StructType, StructField, StringType, IntegerType, ArrayType
 
 # Initialize Spark session
-spark = SparkSession.builder.appName("AddMissingFieldsWithArrays").getOrCreate()
+spark = SparkSession.builder.appName("AddMissingFieldsWithArraysFixed").getOrCreate()
 
 # Sample DataFrame with nested structs and arrays
 data = [
@@ -38,6 +38,10 @@ target_schema = StructType([
                 StructField("code", IntegerType()),
                 StructField("flag", StringType())
             ]))
+        ]))),
+        StructField("extra_array", ArrayType(StructType([  # New array of structs
+            StructField("id", IntegerType()),
+            StructField("desc", StringType())
         ])))
     ])),
     StructField("tags", ArrayType(StringType())),
@@ -90,11 +94,15 @@ def build_struct_expr(target_schema, df_schema, prefix="", is_array_element=Fals
         elif isinstance(field.dataType, ArrayType) and isinstance(field.dataType.elementType, StructType):
             # Handle array of structs
             sub_df_schema = next((f.dataType.elementType for f in df_schema.fields if f.name == field.name), StructType([]))
+            array_col = col(full_path) if full_path in df_field_names else array(lit(None).cast(field.dataType.elementType))
             fields.append(
-                transform(
-                    col(full_path) if full_path in df_field_names else lit(None),
-                    lambda x: build_struct_expr(field.dataType.elementType, sub_df_schema, "", is_array_element=True)
-                ).alias(field.name)
+                when(
+                    array_col.isNotNull(),
+                    transform(
+                        coalesce(array_col, array(lit(None).cast(field.dataType.elementType))),
+                        lambda x: build_struct_expr(field.dataType.elementType, sub_df_schema, "", is_array_element=True)
+                    )
+                ).otherwise(lit(None).cast(field.dataType)).alias(field.name)
             )
         else:
             # Use existing field if available, otherwise use null
@@ -130,11 +138,7 @@ def align_dataframe_to_schema(df, target_schema):
             elif isinstance(field.dataType, ArrayType) and isinstance(field.dataType.elementType, StructType):
                 df_updated = df_updated.withColumn(
                     field.name,
-                    transform(
-                        lit(None),
-                        lambda x: struct(*[lit(None).cast(subfield.dataType).alias(subfield.name) 
-                                          for subfield in field.dataType.elementType.fields])
-                    )
+                    array(lit(None).cast(field.dataType.elementType))
                 )
             else:
                 df_updated = df_updated.withColumn(
@@ -150,10 +154,13 @@ def align_dataframe_to_schema(df, target_schema):
         elif isinstance(field.dataType, ArrayType) and isinstance(field.dataType.elementType, StructType):
             df_sub_schema = next((f.dataType.elementType for f in df_updated.schema.fields if f.name == field.name), StructType([]))
             select_expr.append(
-                transform(
-                    col(field.name),
-                    lambda x: build_struct_expr(field.dataType.elementType, df_sub_schema, "", is_array_element=True)
-                ).alias(field.name)
+                when(
+                    col(field.name).isNotNull(),
+                    transform(
+                        coalesce(col(field.name), array(lit(None).cast(field.dataType.elementType))),
+                        lambda x: build_struct_expr(field.dataType.elementType, df_sub_schema, "", is_array_element=True)
+                    )
+                ).otherwise(lit(None).cast(field.dataType)).alias(field.name)
             )
         else:
             select_expr.append(col(field.name))
