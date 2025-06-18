@@ -210,7 +210,7 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
     """
     Normalizes nullability in a PySpark DataFrame based on the schema.
     For optional structs/maps with required nested fields, sets to NULL if all required fields are NULL or empty.
-    For optional arrays, sets to NULL if empty or NULL. For non-nullable arrays, sets to NULL if empty, NULL, or all required nested fields are NULL.
+    For optional arrays, sets to NULL if empty or NULL. For non-nullable arrays, sets to empty array if empty or NULL.
     Recursively normalizes nested arrays and structs at any level using explode and aggregation.
     
     Args:
@@ -271,27 +271,16 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
             element_type = field_type.elementType
             temp_col = f"_elem_{field_name.replace('.', '_')}"
             
-            # Get path-to-alias mappings for all fields in schema
-            path_to_alias = get_column_paths(current_df.schema)
-            
-            # Select columns with fully qualified paths or unique aliases
+            # Select top-level columns, preserving complex fields
             select_cols = []
-            alias_to_path = {}  # Maps alias back to full path
+            alias_to_path = {}
             for c in current_df.schema.fields:
                 if c.name != field_name:
-                    full_path = c.name
-                    # If field is a struct or array, include its subfields
-                    if isinstance(c.dataType, (StructType, ArrayType)):
-                        sub_paths = get_column_paths(c.dataType, f"{c.name}.")
-                        for sub_path, alias in sub_paths.items():
-                            select_cols.append(col(sub_path).alias(alias))
-                            alias_to_path[alias] = sub_path
-                    else:
-                        alias = path_to_alias.get(full_path, full_path.replace(".", "_"))
-                        select_cols.append(col(full_path).alias(alias))
-                        alias_to_path[alias] = full_path
+                    select_cols.append(col(c.name).alias(c.name))
+                    alias_to_path[c.name] = c.name
             
             # Debug: Print schema before explode
+            # print(f"Before explode for {field_name}:")
             # current_df.printSchema()
             
             exploded_df = current_df.select(
@@ -300,6 +289,7 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
             )
             
             # Debug: Print schema after explode
+            # print(f"After explode for {field_name}:")
             # exploded_df.printSchema()
             
             # Normalize array elements
@@ -326,13 +316,10 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
                 isinstance(exploded_df.schema[c].dataType, MapType)
             ]
             
-            # Aggregate back to array, preserving non-orderable and aliased columns
+            # Aggregate back to array, preserving all columns
             agg_exprs = [collect_list(f"_norm_{temp_col}").alias("_temp_array")]
-            for non_orderable in non_orderable_cols:
-                agg_exprs.append(first(non_orderable, ignorenulls=True).alias(alias_to_path.get(non_orderable, non_orderable)))
-            for alias, orig_path in alias_to_path.items():
-                if alias in exploded_df.columns and alias not in non_orderable_cols:
-                    agg_exprs.append(first(alias, ignorenulls=True).alias(orig_path))
+            for col_name in non_orderable_cols + [c for c in exploded_df.columns if c != temp_col and c != f"_norm_{temp_col}" and c not in non_orderable_cols]:
+                agg_exprs.append(first(col_name, ignorenulls=True).alias(alias_to_path.get(col_name, col_name)))
             
             agg_df = exploded_df.groupBy(*orderable_cols).agg(*agg_exprs)
             
@@ -346,35 +333,18 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
                     array_expr
                 )
             else:
-                required_fields = []
-                if isinstance(element_type, StructType):
-                    required_fields = [f for f in element_type.fields if not f.nullable]
-                if required_fields:
-                    conditions = [array_expr.isNull() | (size(array_expr) == 0)]
-                    for req_field in required_fields:
-                        non_null_count = expr(
-                            f"size(filter(_temp_array, x -> x.{req_field.name} IS NOT NULL))"
-                        )
-                        conditions.append(non_null_count == 0)
-                    combined_condition = conditions[0]
-                    for cond in conditions[1:]:
-                        combined_condition = combined_condition & cond
-                    array_expr = when(
-                        combined_condition,
-                        lit(None)
-                    ).otherwise(
-                        array_expr
-                    )
-                else:
-                    array_expr = when(
-                        array_expr.isNull() | (size(array_expr) == 0),
-                        lit(None)
-                    ).otherwise(
-                        array_expr
-                    )
+                array_expr = coalesce(
+                    array_expr,
+                    array().cast(field_type)
+                )
             
             # Update DataFrame with normalized array
             result_df = agg_df.withColumn(field_name, array_expr).drop("_temp_array")
+            
+            # Debug: Print schema after aggregation
+            # print(f"After aggregation for {field_name}:")
+            # result_df.printSchema()
+            
             return result_df, col(field_name).alias(field_name)
         
         elif isinstance(field_type, MapType):
@@ -410,10 +380,20 @@ def normalize_nulls(df: DataFrame, schema: StructType) -> DataFrame:
         else:
             return current_df, col(field_name).alias(field_name)
     
-    # Process each top-level field
+    # Process all fields simultaneously to avoid logical plan issues
     result_df = df
+    field_exprs = []
     for field in schema.fields:
-        result_df, field_expr = normalize_struct(result_df, field, col(field.name), "")
-        result_df = result_df.withColumn(field.name, field_expr)
+        _, field_expr = normalize_struct(result_df, field, col(field.name), "")
+        field_exprs.append(field_expr.alias(field.name))
+    
+    # Apply all transformations in a single select
+    result_df = result_df.select(*field_exprs)
+    
+    # Debug: Print final schema and logical plan
+    # print("Final result_df schema:")
+    # result_df.printSchema()
+    # print("Final result_df logical plan:")
+    # print(result_df.explain(True))
     
     return result_df
