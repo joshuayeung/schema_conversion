@@ -3,11 +3,11 @@ from pyspark.sql.functions import col, struct, lit, transform, array, when, coal
 from pyspark.sql.types import StructType, StructField, StringType, IntegerType, ArrayType, MapType
 
 # Initialize Spark session
-spark = SparkSession.builder.appName("AddMissingFieldsComplexCorrected9").getOrCreate()
+spark = SparkSession.builder.appName("AddMissingFieldsComplexCorrected14").getOrCreate()
 
-# Sample DataFrame with complex nested schema (imageCheck not present)
+# Sample DataFrame with complex nested schema (jumiokyx not present)
 data = [
-    (1, None),  # vendorResult is NULL
+    (1, {"jumio": None}),  # vendorResult.jumio is NULL
     (2, {"jumio": {"verification": {"someOtherField": "value"}}}),
     (3, {"jumio": {"verification": {"someOtherField": "value2"}}})
 ]
@@ -16,33 +16,32 @@ schema = StructType([
     StructField("vendorResult", StructType([
         StructField("jumio", StructType([
             StructField("verification", StructType([
-                StructField("someOtherField", StringType())  # Placeholder field, no additionalChecks/imageCheck
+                StructField("someOtherField", StringType())
             ]))
         ]))
     ]))
 ])
 df = spark.createDataFrame(data, schema)
 
-# Target schema with imageCheck added
+# Target schema with jumiokyx added
 target_schema = StructType([
     StructField("id", IntegerType()),
     StructField("vendorResult", StructType([
         StructField("jumio", StructType([
             StructField("verification", StructType([
-                StructField("additionalChecks", StructType([
-                    StructField("imageCheck", ArrayType(StructType([
-                        StructField("decisionDetails", StructType([])),
-                        StructField("faceSearchFindings", StructType([
-                            StructField("status", StringType()),
-                            StructField("findings", StringType())
-                        ])),
-                        StructField("credentials", StructType([]))
-                    ])))
-                ]))
+                StructField("someOtherField", StringType())
+            ]))
+        ])),
+        StructField("jumiokyx", StructType([
+            StructField("kyxData", StructType([
+                StructField("checks", ArrayType(StructType([
+                    StructField("checkId", StringType()),
+                    StructField("status", StringType())
+                ])))
             ]))
         ]))
     ])),
-    StructField("extra_field", StringType())  # New top-level field
+    StructField("extra_field", StringType())
 ])
 
 # Show original DataFrame and schema
@@ -72,7 +71,7 @@ def build_struct_expr(target_schema, df_schema, prefix="", is_array_element=Fals
     Args:
         target_schema: Target schema for the struct
         df_schema: Current DataFrame schema for the struct
-        prefix: Column prefix (e.g., 'vendorResult.jumio')
+        prefix: Column prefix (e.g., 'vendorResult')
         is_array_element: True if processing a struct within an array
         is_map_value: True if processing a struct within a map's value
         lambda_var: Lambda variable (e.g., 'x' for arrays, 'y' for maps)
@@ -100,15 +99,14 @@ def build_struct_expr(target_schema, df_schema, prefix="", is_array_element=Fals
             sub_df_schema = next((f.dataType for f in df_schema.fields if f.name == field.name), StructType([]))
             print(f"Subschema for {field.name}: {[f.name for f in sub_df_schema.fields] if isinstance(sub_df_schema, StructType) else []}")
             if (is_array_element or is_map_value) and lambda_var is not None:
-                # For structs within arrays or maps, check if the field exists in lambda_var
                 field_ref = getattr(lambda_var, field.name) if field.name in [f.name for f in df_schema.fields] else None
                 field_expr = when(
-                    field_ref.isNotNull() if field_ref is not None else lit(False),
+                    field_ref.isNotNull() if field_ref is not None else lit(True),
                     build_struct_expr(field.dataType, sub_df_schema, "", is_array_element=is_array_element, is_map_value=is_map_value, lambda_var=field_ref)
                 ).otherwise(struct(*[lit(None).cast(subfield.dataType).alias(subfield.name) for subfield in field.dataType.fields]))
             else:
                 field_expr = when(
-                    col(prefix).isNotNull() if prefix and not (is_array_element or is_map_value) else lit(True),
+                    col(full_path).isNotNull() if field.name in [f.name for f in df_schema.fields] else lit(True),
                     build_struct_expr(field.dataType, sub_df_schema, full_path, is_array_element, is_map_value, lambda_var)
                 ).otherwise(struct(*[lit(None).cast(subfield.dataType).alias(subfield.name) for subfield in field.dataType.fields]))
             fields.append(field_expr.alias(field.name))
@@ -118,14 +116,10 @@ def build_struct_expr(target_schema, df_schema, prefix="", is_array_element=Fals
             sub_df_schema = next((f.dataType.elementType for f in df_schema.fields if f.name == field.name), StructType([]))
             print(f"Subschema for {field.name}: {[f.name for f in sub_df_schema.fields] if isinstance(sub_df_schema, StructType) else []}")
             if isinstance(field.dataType.elementType, StructType):
-                # Initialize missing array fields with [null]
                 if (is_array_element or is_map_value) and lambda_var is not None:
                     array_col = getattr(lambda_var, field.name) if field.name in [f.name for f in df_schema.fields] else array(lit(None).cast(field.dataType.elementType))
                 else:
-                    array_col = when(
-                        col(prefix).isNotNull() if prefix else lit(True),
-                        col(full_path)
-                    ).otherwise(array(lit(None).cast(field.dataType.elementType))) if full_path in df_field_names else array(lit(None).cast(field.dataType.elementType))
+                    array_col = col(full_path) if field.name in [f.name for f in df_schema.fields] else array(lit(None).cast(field.dataType.elementType))
                 field_expr = when(
                     array_col.isNotNull(),
                     transform(
@@ -136,16 +130,12 @@ def build_struct_expr(target_schema, df_schema, prefix="", is_array_element=Fals
                 fields.append(field_expr)
                 print(f"Generated expr for {field.name}: {field_expr}")
             else:
-                # Non-struct arrays
                 if (is_array_element or is_map_value) and lambda_var is not None:
                     field_ref = getattr(lambda_var, field.name) if field.name in [f.name for f in df_schema.fields] else lit(None).cast(field.dataType)
                     fields.append(field_ref.alias(field.name))
                     print(f"Generated expr for {field.name}: {field_ref}")
                 else:
-                    field_ref = when(
-                        col(prefix).isNotNull() if prefix and not (is_array_element or is_map_value) else lit(True),
-                        col(full_path)
-                    ).otherwise(lit(None).cast(field.dataType)) if full_path in df_field_names else array(lit(None).cast(field.dataType.elementType))
+                    field_ref = col(full_path) if field.name in [f.name for f in df_schema.fields] else lit(None).cast(field.dataType)
                     fields.append(field_ref.alias(field.name))
                     print(f"Generated expr for {field.name}: {field_ref}")
         elif isinstance(field.dataType, MapType):
@@ -153,10 +143,7 @@ def build_struct_expr(target_schema, df_schema, prefix="", is_array_element=Fals
             if (is_array_element or is_map_value) and lambda_var is not None:
                 map_col = getattr(lambda_var, field.name) if field.name in [f.name for f in df_schema.fields] else lit(None).cast(field.dataType)
             else:
-                map_col = when(
-                    col(prefix).isNotNull() if prefix and not (is_array_element or is_map_value) else lit(True),
-                    col(full_path)
-                ).otherwise(lit(None).cast(field.dataType)) if full_path in df_field_names else lit(None).cast(field.dataType)
+                map_col = col(full_path) if field.name in [f.name for f in df_schema.fields] else lit(None).cast(field.dataType)
             if isinstance(field.dataType.valueType, StructType):
                 sub_df_schema = next((f.dataType.valueType for f in df_schema.fields if f.name == field.name), StructType([]))
                 field_expr = when(
@@ -173,7 +160,7 @@ def build_struct_expr(target_schema, df_schema, prefix="", is_array_element=Fals
                 print(f"Generated expr for {field.name}: {field_expr}")
             else:
                 fields.append(map_col.alias(field.name))
-                print(f"Generated expr for {field.name}: {map_col}")
+                print(f"Generated expr for {field.name}: {field_ref}")
         else:
             # Simple types (e.g., IntegerType, StringType)
             if (is_array_element or is_map_value) and lambda_var is not None:
@@ -181,13 +168,63 @@ def build_struct_expr(target_schema, df_schema, prefix="", is_array_element=Fals
                 fields.append(field_ref.alias(field.name))
                 print(f"Generated expr for {field.name}: {field_ref}")
             else:
-                field_ref = when(
-                    col(prefix).isNotNull() if prefix and not (is_array_element or is_map_value) else lit(True),
-                    col(full_path)
-                ).otherwise(lit(None).cast(field.dataType)) if full_path in df_field_names else lit(None).cast(field.dataType)
+                field_ref = col(full_path) if field.name in [f.name for f in df_schema.fields] else lit(None).cast(field.dataType)
                 fields.append(field_ref.alias(field.name))
                 print(f"Generated expr for {field.name}: {field_ref}")
     return struct(*fields)
+
+def add_missing_nested_fields(df, target_schema, prefix="", df_schema=None):
+    """
+    Recursively add missing fields to the DataFrame at all levels of the schema.
+    
+    Args:
+        df: PySpark DataFrame
+        target_schema: Target schema
+        prefix: Current column prefix (e.g., 'vendorResult')
+        df_schema: Current DataFrame schema (defaults to df.schema)
+    
+    Returns:
+        DataFrame with all missing fields added
+    """
+    from pyspark.sql.types import StructType, ArrayType, MapType
+
+    if df_schema is None:
+        df_schema = df.schema
+
+    df_updated = df
+    for field in target_schema.fields:
+        full_path = f"{prefix}.{field.name}" if prefix else field.name
+        df_field_names = [f.name for f in df_schema.fields] if isinstance(df_schema, StructType) else []
+
+        if field.name not in df_field_names:
+            # Add missing field
+            if isinstance(field.dataType, StructType):
+                df_updated = df_updated.withColumn(
+                    full_path,
+                    struct(*[lit(None).cast(subfield.dataType).alias(subfield.name) 
+                             for subfield in field.dataType.fields])
+                )
+            elif isinstance(field.dataType, ArrayType):
+                df_updated = df_updated.withColumn(
+                    full_path,
+                    array(lit(None).cast(field.dataType.elementType))
+                )
+            elif isinstance(field.dataType, MapType):
+                df_updated = df_updated.withColumn(
+                    full_path,
+                    lit(None).cast(field.dataType)
+                )
+            else:
+                df_updated = df_updated.withColumn(
+                    full_path,
+                    lit(None).cast(field.dataType)
+                )
+        elif isinstance(field.dataType, StructType):
+            # Recurse into nested structs
+            sub_df_schema = next((f.dataType for f in df_schema.fields if f.name == field.name), StructType([]))
+            df_updated = add_missing_nested_fields(df_updated, field.dataType, full_path, sub_df_schema)
+
+    return df_updated
 
 def align_dataframe_to_schema(df, target_schema):
     """
@@ -203,36 +240,13 @@ def align_dataframe_to_schema(df, target_schema):
     """
     from pyspark.sql.types import StructType, ArrayType, MapType
 
-    # Process top-level fields
-    df_updated = df
-    for field in target_schema.fields:
-        if field.name not in [f.name for f in df.schema.fields]:
-            # Add missing top-level field
-            if isinstance(field.dataType, StructType):
-                df_updated = df_updated.withColumn(
-                    field.name,
-                    struct(*[lit(None).cast(subfield.dataType).alias(subfield.name) 
-                             for subfield in field.dataType.fields])
-                )
-            elif isinstance(field.dataType, ArrayType):
-                df_updated = df_updated.withColumn(
-                    field.name,
-                    array(lit(None).cast(field.dataType.elementType))
-                )
-            elif isinstance(field.dataType, MapType):
-                df_updated = df_updated.withColumn(
-                    field.name,
-                    lit(None).cast(field.dataType)
-                )
-            else:
-                df_updated = df_updated.withColumn(
-                    field.name,
-                    lit(None).cast(field.dataType)
-                )
+    # Add missing fields at all levels
+    df_updated = add_missing_nested_fields(df, target_schema)
 
     # Build select expression to match target schema
     select_expr = []
     for field in target_schema.fields:
+        full_path = field.name
         if isinstance(field.dataType, StructType):
             df_sub_schema = next((f.dataType for f in df_updated.schema.fields if f.name == field.name), StructType([]))
             expr = build_struct_expr(field.dataType, df_sub_schema, field.name).alias(field.name)
