@@ -1,15 +1,17 @@
-
 import pandas as pd
 import pyarrow as pa
 from typing import Any, List, Dict
 import numpy as np
+from pyspark.sql.types import Row
+
 def pandas_to_arrow_with_nested_schema(df: pd.DataFrame, schema: pa.Schema) -> pa.Table:
     """
     Convert a pandas DataFrame to a PyArrow Table, aligning with a schema that may include
     multi-level nested types (struct, list, map_). Missing columns are filled with nulls.
+    Supports PySpark Row objects for struct fields.
     
     Args:
-        df (pd.DataFrame): Input pandas DataFrame.
+        df (pd.DataFrame): Input pandas DataFrame, possibly containing Row objects.
         schema (pa.Schema): Target PyArrow schema with possible nested types.
     
     Returns:
@@ -82,7 +84,7 @@ def _convert_to_arrow_array(series: pd.Series, field_type: pa.DataType, field_na
 def _convert_to_struct_array(series: pd.Series, struct_type: pa.StructType, field_name: str) -> pa.Array:
     """
     Convert a pandas Series to a PyArrow struct array, handling nested fields recursively.
-    Assumes Series contains dictionaries or None.
+    Supports PySpark Row objects and dictionaries.
     """
     # Replace pandas NA/NaN with None
     series = series.where(~series.isna(), None)
@@ -98,14 +100,17 @@ def _convert_to_struct_array(series: pd.Series, struct_type: pa.StructType, fiel
         if item is None:
             records.append(None)
         else:
+            # Convert PySpark Row to dict if necessary
+            if isinstance(item, Row):
+                item = item.asDict(recursive=True)
             if not isinstance(item, dict):
-                raise ValueError(f"Expected dict for struct field '{field_name}', got {type(item)} in {item}")
+                raise ValueError(f"Expected dict or Row for struct field '{field_name}', got {type(item)} in {item}")
             record = {}
             for subfield_name, subfield_type in struct_fields.items():
                 value = item.get(subfield_name, None)
                 if value is not None and (pa.types.is_struct(subfield_type) or pa.types.is_list(subfield_type) or pa.types.is_map(subfield_type)):
                     # Recursively convert nested types
-                    sub_series = pd.Series([value])
+                    sub_series = pd.Series([value]).where(~pd.Series([value]).isna(), None)
                     sub_array = _convert_to_arrow_array(sub_series, subfield_type, f"{field_name}.{subfield_name}")
                     record[subfield_name] = sub_array[0]
                 else:
@@ -142,7 +147,6 @@ def _convert_to_list_array(series: pd.Series, list_type: pa.ListType, field_name
                 if len(item) == 0:
                     data.append([])
                 else:
-                    # Ensure list elements are valid
                     sub_series = pd.Series(item).where(~pd.Series(item).isna(), None)
                     sub_array = _convert_to_arrow_array(sub_series, value_type, f"{field_name}.list")
                     data.append(sub_array)
@@ -196,40 +200,31 @@ def _convert_to_map_array(series: pd.Series, map_type: pa.MapType, field_name: s
     except Exception as e:
         raise ValueError(f"Failed to convert column '{field_name}' to map {map_type}: {str(e)}")
 
+
 import pandas as pd
 import pyarrow as pa
-import numpy as np
+from pyspark.sql.types import Row
 
-# Sample DataFrame
+# Sample DataFrame with PySpark Row objects
 df = pd.DataFrame({
-    'name': ['Alice', 'Bob', 'Charlie'],
-    'nested': [
-        {
-            'info': {'age': 25, 'city': 'New York'},
-            'scores': [90, 85],
-            'tags': {'a': {'x': 1}, 'b': {'x': 2}}
-        },
-        {
-            'info': {'age': 30, 'city': 'London'},
-            'scores': [88, 92],
-            'tags': {'c': {'x': 3}}
-        },
+    'id': [1, 2, 3],
+    'vendorResult': [
+        Row(jumio=None),
+        Row(jumio=Row(score=95, details='Verified')),
         None
     ]
 })
 
-# Sample schema with nested types
+# Sample PyArrow schema
 schema = pa.schema([
-    ('name', pa.string()),
-    ('nested', pa.struct([
-        ('info', pa.struct([
-            ('age', pa.int64()),
-            ('city', pa.string())
-        ])),
-        ('scores', pa.list_(pa.int64())),
-        ('tags', pa.map_(pa.string(), pa.struct([('x', pa.int64())])))
+    ('id', pa.int64()),
+    ('vendorResult', pa.struct([
+        ('jumio', pa.struct([
+            ('score', pa.int64()),
+            ('details', pa.string())
+        ]))
     ])),
-    ('extra', pa.list_(pa.map_(pa.string(), pa.int64())))
+    ('extra', pa.list_(pa.int64()))  # Missing column
 ])
 
 # Convert DataFrame to PyArrow Table
