@@ -1,9 +1,9 @@
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, struct, lit, transform, array, when, coalesce, map_from_arrays, map_keys, map_values
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType, ArrayType, MapType
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, ArrayType, MapType, BooleanType, FloatType, DoubleType, LongType
 
 # Initialize Spark session
-spark = SparkSession.builder.appName("AddMissingFieldsComplexCorrected26").getOrCreate()
+spark = SparkSession.builder.appName("AddMissingFieldsComplexCorrected35").getOrCreate()
 
 # Sample DataFrame with complex nested schema (jumiokyx not present)
 data = [
@@ -23,7 +23,7 @@ schema = StructType([
 ])
 df = spark.createDataFrame(data, schema)
 
-# Target schema with jumiokyx added, status non-nullable
+# Target schema with jumiokyx added, kyxData non-nullable
 target_schema = StructType([
     StructField("id", IntegerType(), True),
     StructField("vendorResult", StructType([
@@ -38,7 +38,7 @@ target_schema = StructType([
                     StructField("checkId", StringType(), True),
                     StructField("status", StringType(), False)
                 ]), True), True)
-            ]), True)
+            ]), False)
         ]), True)
     ]), True),
     StructField("extra_field", StringType(), True)
@@ -63,10 +63,80 @@ def get_field_names(schema, prefix="", in_array=False, in_map=False):
             fields.extend(get_field_names(field.dataType.valueType, full_path, in_map=True))
     return fields
 
+def print_schema_structure(schema, indent=0):
+    """Print the schema structure with indentation for debugging."""
+    for field in schema.fields:
+        print("  " * indent + f"Field: {field.name}, Type: {field.dataType.simpleString()}, Nullable: {field.nullable}")
+        if isinstance(field.dataType, StructType):
+            print_schema_structure(field.dataType, indent + 1)
+        elif isinstance(field.dataType, ArrayType) and isinstance(field.dataType.elementType, StructType):
+            print("  " * (indent + 1) + "Array element:")
+            print_schema_structure(field.dataType.elementType, indent + 2)
+
+def validate_schema(schema, prefix=""):
+    """Validate schema to ensure no duplicate or incorrect fields."""
+    from pyspark.sql.types import StructType
+    for field in schema.fields:
+        full_path = f"{prefix}.{field.name}" if prefix else field.name
+        if isinstance(field.dataType, StructType):
+            subfields = [f.name for f in field.dataType.fields]
+            if field.name in subfields:
+                print(f"Validation error: Field {field.name} appears in its own subfields {subfields} at {full_path}")
+                raise ValueError(f"Invalid schema: {field.name} cannot be a subfield of itself at {full_path}")
+            validate_schema(field.dataType, full_path)
+
+def generate_default_struct(field_type):
+    """
+    Generate a default struct expression for a given schema, handling non-nullable fields recursively.
+    
+    Args:
+        field_type: DataType of the field (e.g., StructType, ArrayType, StringType)
+    
+    Returns:
+        PySpark Column expression with default values
+    """
+    from pyspark.sql.types import StructType, ArrayType, MapType, StringType, IntegerType, BooleanType, FloatType, DoubleType, LongType
+
+    if isinstance(field_type, StructType):
+        default_fields = []
+        for subfield in field_type.fields:
+            if not subfield.nullable:
+                # Non-nullable field: provide default value
+                default_value = generate_default_struct(subfield.dataType)
+                default_fields.append(default_value.alias(subfield.name))
+                print(f"Assigned default value for non-nullable field {subfield.name}: {default_value}")
+            else:
+                # Nullable field: use NULL
+                default_fields.append(lit(None).cast(subfield.dataType).alias(subfield.name))
+        return struct(*default_fields)
+    elif isinstance(field_type, ArrayType):
+        if not field_type.containsNull:
+            # Non-nullable array: provide empty array with default element
+            element_default = generate_default_struct(field_type.elementType)
+            return array(element_default).cast(field_type)
+        else:
+            # Nullable array: use NULL
+            return lit(None).cast(field_type)
+    elif isinstance(field_type, MapType):
+        # Maps are typically nullable; use NULL
+        return lit(None).cast(field_type)
+    else:
+        # Simple types: provide default values for non-nullable fields
+        if isinstance(field_type, StringType):
+            return lit("")  # Default for non-nullable string
+        elif isinstance(field_type, IntegerType) or isinstance(field_type, LongType):
+            return lit(0)  # Default for non-nullable integer/long
+        elif isinstance(field_type, BooleanType):
+            return lit(False)  # Default for non-nullable boolean
+        elif isinstance(field_type, FloatType) or isinstance(field_type, DoubleType):
+            return lit(0.0)  # Default for non-nullable float/double
+        else:
+            return lit(None).cast(field_type)  # Nullable or unknown types
+
 def build_struct_expr(target_schema, df_schema, prefix="", is_array_element=False, is_map_value=False, lambda_var=None):
     """
     Build a struct expression for a schema, using existing fields from df_schema
-    and nulls for missing fields. Handles structs, arrays, and maps recursively.
+    and default values for missing fields. Handles structs, arrays, and maps recursively.
     
     Args:
         target_schema: Target schema for the struct
@@ -100,15 +170,23 @@ def build_struct_expr(target_schema, df_schema, prefix="", is_array_element=Fals
             print(f"Subschema for {field.name}: {[f.name for f in sub_df_schema.fields] if isinstance(sub_df_schema, StructType) else []}")
             if (is_array_element or is_map_value) and lambda_var is not None:
                 field_ref = getattr(lambda_var, field.name)
-                field_expr = when(
-                    field_ref.isNotNull(),
-                    build_struct_expr(field.dataType, sub_df_schema, "", is_array_element=is_array_element, is_map_value=is_map_value, lambda_var=field_ref)
-                ).otherwise(struct(*[lit(None).cast(subfield.dataType).alias(subfield.name) for subfield in field.dataType.fields]))
+                if field.nullable:
+                    field_expr = when(
+                        field_ref.isNotNull(),
+                        build_struct_expr(field.dataType, sub_df_schema, "", is_array_element=is_array_element, is_map_value=is_map_value, lambda_var=field_ref)
+                    ).otherwise(generate_default_struct(field.dataType) if not field.nullable else struct(*[lit(None).cast(subfield.dataType).alias(subfield.name) for subfield in field.dataType.fields]))
+                else:
+                    # Non-nullable struct: provide default values
+                    field_expr = build_struct_expr(field.dataType, sub_df_schema, "", is_array_element=is_array_element, is_map_value=is_map_value, lambda_var=field_ref)
             else:
-                field_expr = when(
-                    col(full_path).isNotNull(),
-                    build_struct_expr(field.dataType, sub_df_schema, full_path, is_array_element, is_map_value, lambda_var)
-                ).otherwise(struct(*[lit(None).cast(subfield.dataType).alias(subfield.name) for subfield in field.dataType.fields]))
+                if field.nullable:
+                    field_expr = when(
+                        col(full_path).isNotNull(),
+                        build_struct_expr(field.dataType, sub_df_schema, full_path, is_array_element, is_map_value, lambda_var)
+                    ).otherwise(generate_default_struct(field.dataType) if not field.nullable else struct(*[lit(None).cast(subfield.dataType).alias(subfield.name) for subfield in field.dataType.fields]))
+                else:
+                    # Non-nullable struct: provide default values
+                    field_expr = build_struct_expr(field.dataType, sub_df_schema, full_path, is_array_element, is_map_value, lambda_var)
             fields.append(field_expr.alias(field.name))
             print(f"Generated expr for {field.name}: {field_expr}")
         elif isinstance(field.dataType, ArrayType):
@@ -173,10 +251,66 @@ def build_struct_expr(target_schema, df_schema, prefix="", is_array_element=Fals
                 print(f"Generated expr for {field.name}: {field_ref}")
     return struct(*fields)
 
+def clean_null_structs(df, schema, prefix=""):
+    """
+    Recursively set nullable struct fields to NULL if all their subfields are NULL.
+    
+    Args:
+        df: PySpark DataFrame
+        schema: Schema to process
+        prefix: Current column prefix (e.g., 'vendorResult')
+    
+    Returns:
+        Updated DataFrame with cleaned structs
+    """
+    from pyspark.sql.types import StructType
+
+    df_updated = df
+    print(f"Processing clean_null_structs at prefix: {prefix}")
+    print("Schema structure:")
+    print_schema_structure(schema)
+
+    for field in schema.fields:
+        full_path = f"{prefix}.{field.name}" if prefix else field.name
+        if not isinstance(field.dataType, StructType):
+            print(f"Skipping non-struct field: {full_path}")
+            continue
+        print(f"Processing struct field: {full_path}, nullable: {field.nullable}")
+        print(f"Subfields for {full_path}: {[subfield.name for subfield in field.dataType.fields]}")
+        if field.nullable:
+            # Generate condition: all subfields are NULL
+            subfields = field.dataType.fields
+            if subfields:  # Only process structs with subfields
+                null_conditions = []
+                for subfield in subfields:
+                    subfield_path = f"{full_path}.{subfield.name}"
+                    print(f"Checking null condition for: {subfield_path}")
+                    null_conditions.append(col(subfield_path).isNull())
+                if null_conditions:
+                    all_null_condition = null_conditions[0]
+                    for condition in null_conditions[1:]:
+                        all_null_condition = all_null_condition & condition
+                    print(f"Applying cleanup for {full_path} with condition: {all_null_condition}")
+                    df_updated = df_updated.withColumn(
+                        full_path,
+                        when(all_null_condition, lit(None).cast(field.dataType)).otherwise(col(full_path))
+                    )
+                    print(f"Applied cleanup for {full_path}")
+                else:
+                    print(f"No subfields to check for {full_path}, skipping cleanup")
+            else:
+                print(f"No subfields for {full_path}, skipping cleanup")
+        else:
+            print(f"Skipping non-nullable struct: {full_path}")
+        # Recurse into nested structs (nullable or non-nullable)
+        df_updated = clean_null_structs(df_updated, field.dataType, full_path)
+
+    return df_updated
+
 def add_missing_nested_fields(df, target_schema, prefix="", df_schema=None):
     """
     Recursively add missing fields to the DataFrame at all levels of the schema,
-    setting nullable structs to NULL when missing and nesting fields correctly.
+    setting nullable structs to NULL and non-nullable structs to default values.
     
     Args:
         df: PySpark DataFrame
@@ -210,10 +344,10 @@ def add_missing_nested_fields(df, target_schema, prefix="", df_schema=None):
             print(f"Adding missing field: {full_path}")
             if isinstance(field.dataType, StructType):
                 if prefix:
-                    # Add nullable struct (e.g., jumiokyx) within parent struct (e.g., vendorResult)
+                    # Add struct (e.g., jumiokyx) within parent struct (e.g., vendorResult)
                     parent_field = prefix.split('.')[-1]
-                    # Find parent schema in the top-level schema
-                    parent_schema = next((f for f in df_updated.schema.fields if f.name == parent_field), None)
+                    # Find parent field in updated_schema_fields
+                    parent_schema = next((f for f in updated_schema_fields if f.name == parent_field), None)
                     if parent_schema and isinstance(parent_schema.dataType, StructType):
                         parent_fields = parent_schema.dataType.fields
                         new_parent_fields = list(parent_fields) + [StructField(field_name, field.dataType, field.nullable)]
@@ -221,17 +355,21 @@ def add_missing_nested_fields(df, target_schema, prefix="", df_schema=None):
                         struct_fields = []
                         for f in parent_fields:
                             struct_fields.append(col(f"{prefix}.{f.name}").alias(f.name))
-                        struct_fields.append(lit(None).cast(field.dataType).alias(field_name))
+                        struct_fields.append(generate_default_struct(field.dataType).alias(field_name))
+                        print(f"Initialized {full_path} with default struct: {struct_fields[-1]}")
                         df_updated = df_updated.withColumn(
                             parent_field,
-                            struct(*struct_fields)
+                            when(
+                                col(parent_field).isNotNull(),
+                                struct(*struct_fields)
+                            ).otherwise(lit(None).cast(new_parent_schema))
                         )
-                        print(f"Updated {parent_field} with {field_name}: NULL")
-                        # Update the schema
+                        print(f"Updated {parent_field} with {field_name}")
+                        # Update the schema using updated_schema_fields
                         updated_schema_fields = [
                             StructField(f.name, new_parent_schema if f.name == parent_field else f.dataType, f.nullable)
-                            for f in df_updated.schema.fields
-                        ] + [StructField(field_name, field.dataType, field.nullable) if f.name != parent_field else StructField(f.name, new_parent_schema, f.nullable) for f in updated_schema_fields]
+                            for f in updated_schema_fields
+                        ]
                     else:
                         print(f"Error: Parent field {parent_field} not found or not a struct at prefix {prefix}. Skipping field addition.")
                         continue
@@ -244,19 +382,18 @@ def add_missing_nested_fields(df, target_schema, prefix="", df_schema=None):
                     print(f"Initialized {full_path} with NULL")
                     updated_schema_fields.append(StructField(field_name, field.dataType, field.nullable))
                 else:
-                    # Recurse into non-nullable structs
-                    sub_df_updated, sub_df_schema = add_missing_nested_fields(
-                        df_updated,
-                        field.dataType,
-                        full_path,
-                        StructType([])
+                    # Non-nullable top-level structs
+                    default_struct = generate_default_struct(field.dataType)
+                    df_updated = df_updated.withColumn(
+                        field_name,
+                        default_struct
                     )
-                    df_updated = sub_df_updated
-                    updated_schema_fields.append(StructField(field_name, sub_df_schema, field.nullable))
+                    print(f"Initialized {full_path} with default struct: {default_struct}")
+                    updated_schema_fields.append(StructField(field_name, field.dataType, field.nullable))
             elif isinstance(field.dataType, ArrayType):
                 df_updated = df_updated.withColumn(
                     full_path,
-                    array(lit(None).cast(field.dataType.elementType))
+                    lit(None).cast(field.dataType)
                 )
                 print(f"Initialized {full_path} with [NULL]")
                 updated_schema_fields.append(StructField(field_name, field.dataType, field.nullable))
@@ -286,9 +423,11 @@ def add_missing_nested_fields(df, target_schema, prefix="", df_schema=None):
         
         # Log intermediate schema
         print(f"Schema after processing {full_path}:")
-        df_updated.printSchema()
+        print_schema_structure(StructType(updated_schema_fields))
 
     updated_schema = StructType(updated_schema_fields)
+    print("Validating updated schema:")
+    validate_schema(updated_schema)
     return df_updated, updated_schema
 
 def align_dataframe_to_schema(df, target_schema):
@@ -308,6 +447,13 @@ def align_dataframe_to_schema(df, target_schema):
     # Add missing fields at all levels
     df_updated, updated_schema = add_missing_nested_fields(df, target_schema)
     print("Schema after add_missing_nested_fields:")
+    df_updated.printSchema()
+    print("Updated schema structure:")
+    print_schema_structure(updated_schema)
+
+    # Clean up nullable structs where all subfields are NULL
+    df_updated = clean_null_structs(df_updated, updated_schema)
+    print("Schema after clean_null_structs:")
     df_updated.printSchema()
 
     # Build select expression to match target schema
