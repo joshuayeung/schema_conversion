@@ -8,8 +8,9 @@ from typing import Any, List, Dict
 def pandas_to_arrow_with_nested_schema(df: pd.DataFrame, schema: pa.Schema) -> pa.Table:
     """
     Convert a pandas DataFrame to a PyArrow Table, aligning with a schema that may include
-    multi-level nested types (struct, list, map_). Missing columns or None values in required
-    fields are filled with default values from schema metadata. Supports PySpark Row objects.
+    multi-level nested types (struct, list, map_, dictionary, large_string). Missing columns
+    or None values in required fields are filled with default values from schema metadata.
+    Supports PySpark Row objects.
     
     Args:
         df (pd.DataFrame): Input pandas DataFrame, possibly containing Row objects.
@@ -21,7 +22,7 @@ def pandas_to_arrow_with_nested_schema(df: pd.DataFrame, schema: pa.Schema) -> p
     
     Raises:
         ValueError: If DataFrame contains columns not in schema, data is incompatible, or
-                    required fields lack default values.
+                    required fields lack default values when needed.
     """
     # Validate DataFrame columns against schema
     df_columns = set(df.columns)
@@ -62,7 +63,7 @@ def pandas_to_arrow_with_nested_schema(df: pd.DataFrame, schema: pa.Schema) -> p
 
 def _parse_default_value(default_value: bytes, field_type: pa.DataType, field_name: str) -> Any:
     """
-    Parse the default value from schema metadata based on the field type.
+    Parse the default value from schema metadata based on the field type, including dictionary and large_string types.
     
     Args:
         default_value: Default value from metadata (as bytes).
@@ -82,13 +83,24 @@ def _parse_default_value(default_value: bytes, field_type: pa.DataType, field_na
     default_str = default_value.decode('utf-8')
     
     try:
-        if pa.types.is_struct(field_type):
+        if pa.types.is_dictionary(field_type):
+            # Handle dictionary (enum) type; default must match value_type
+            value_type = field_type.value_type
+            if pa.types.is_string(value_type) or pa.types.is_large_string(value_type):
+                return default_str
+            elif pa.types.is_integer(value_type):
+                return int(default_str)
+            elif pa.types.is_floating(value_type):
+                return float(default_str)
+            else:
+                raise ValueError(f"Unsupported dictionary value type '{value_type}' for field '{field_name}'")
+        elif pa.types.is_struct(field_type):
             return json.loads(default_str)  # Expect JSON string for structs
         elif pa.types.is_list(field_type):
             return json.loads(default_str)  # Expect JSON string for lists
         elif pa.types.is_map(field_type):
             return json.loads(default_str)  # Expect JSON string for maps (list of [key, value])
-        elif pa.types.is_string(field_type):
+        elif pa.types.is_string(field_type) or pa.types.is_large_string(field_type):
             return default_str
         elif pa.types.is_integer(field_type):
             return int(default_str)
@@ -107,7 +119,7 @@ def _convert_to_arrow_array(series: pd.Series, field_type: pa.DataType, field_na
     
     Args:
         series: Pandas Series containing the data.
-        field_type: PyArrow data type (may be struct, list, map_, or primitive).
+        field_type: PyArrow data type (may be struct, list, map_, dictionary, large_string, or primitive).
         field_name: Name of the field for error reporting.
         is_required: Whether the field is required (non-nullable).
         default_value: Default value from schema metadata (as bytes).
@@ -136,7 +148,7 @@ def _convert_to_arrow_array(series: pd.Series, field_type: pa.DataType, field_na
     elif pa.types.is_map(field_type):
         return _convert_to_map_array(series, field_type, field_name, is_required, default_value)
     else:
-        # Handle primitive types
+        # Handle primitive, dictionary, and large_string types
         if is_required:
             default_data = _parse_default_value(default_value, field_type, field_name) if default_value else None
             if default_data is not None:
@@ -193,8 +205,8 @@ def _convert_to_struct_array(series: pd.Series, struct_type: pa.StructType, fiel
                     if subfield_default is None:
                         raise ValueError(f"Required subfield '{field_name}.{subfield_name}' is None and has no default value")
                     value = _parse_default_value(subfield_default, subfield_type, f"{field_name}.{subfield_name}")
-                if value is not None and (pa.types.is_struct(subfield_type) or pa.types.is_list(subfield_type) or pa.types.is_map(subfield_type)):
-                    # Recursively convert nested types
+                if value is not None and (pa.types.is_struct(subfield_type) or pa.types.is_list(subfield_type) or pa.types.is_map(subfield_type) or pa.types.is_dictionary(subfield_type)):
+                    # Recursively convert nested types and dictionary types
                     sub_series = pd.Series([value]).where(~pd.Series([value]).isna(), None)
                     sub_array = _convert_to_arrow_array(sub_series, subfield_type, f"{field_name}.{subfield_name}", subfield_required, subfield_default)
                     record[subfield_name] = sub_array[0]
@@ -241,7 +253,7 @@ def _convert_to_list_array(series: pd.Series, list_type: pa.ListType, field_name
         elif not isinstance(item, (list, tuple)):
             raise ValueError(f"Expected list or tuple for list field '{field_name}', got {type(item)} in {item}")
         else:
-            if pa.types.is_struct(value_type) or pa.types.is_list(value_type) or pa.types.is_map(value_type):
+            if pa.types.is_struct(value_type) or pa.types.is_list(value_type) or pa.types.is_map(value_type) or pa.types.is_dictionary(value_type):
                 # Recursively convert each element in the list
                 if len(item) == 0:
                     data.append([])
@@ -302,7 +314,7 @@ def _convert_to_map_array(series: pd.Series, map_type: pa.MapType, field_name: s
                     if value_default is None:
                         raise ValueError(f"Required map value in '{field_name}' is None and has no default value")
                     value = _parse_default_value(value_default, value_type, f"{field_name}.map.value")
-                if pa.types.is_struct(value_type) or pa.types.is_list(value_type) or pa.types.is_map(value_type):
+                if pa.types.is_struct(value_type) or pa.types.is_list(value_type) or pa.types.is_map(value_type) or pa.types.is_dictionary(value_type):
                     # Recursively convert nested value type
                     sub_series = pd.Series([value]).where(~pd.Series([value]).isna(), None)
                     sub_array = _convert_to_arrow_array(sub_series, value_type, f"{field_name}.map.value", value_required, value_default)
@@ -325,21 +337,23 @@ from pyspark.sql.types import Row
 df = pd.DataFrame({
     'id': [1, 2, 3],
     'vendorResult': [
-        Row(jumio=None),
-        Row(jumio=Row(score=95, details='Verified')),
-        None
+        Row(jumio=None, status=None),  # status should use default 'Pending'
+        Row(jumio=Row(score=95, details='Verified'), status='Approved'),
+        None  # vendorResult should use default
     ]
 })
 
-# Sample schema with required fields and default values
+# Sample schema with optional jumio and required large_string status
 schema = pa.schema([
     ('id', pa.int64(), False, {b'default': b'0'}),  # Required with default 0
     ('vendorResult', pa.struct([
         ('jumio', pa.struct([
-            ('score', pa.int64(), False, {b'default': b'100'}),
-            ('details', pa.string(), False, {b'default': b'Unknown'})
-        ]), False, {b'default': b'{"score": 100, "details": "Unknown"}'})
-    ]), False, {b'default': b'{"jumio": {"score": 100, "details": "Unknown"}}'}),
+            ('score', pa.int64(), True),  # Optional
+            ('details', pa.string(), True)  # Optional
+        ]), True),  # Optional
+        ('status', pa.large_string(), False, {b'default': b'Pending'}),  # Required with default 'Pending'
+        ('category', pa.dictionary(pa.int64(), pa.string()), False, {b'default': b'Unknown'})  # Required dictionary
+    ]), False, {b'default': b'{"jumio": null, "status": "Pending", "category": "Unknown"}'}),  # Required with default
     ('extra', pa.list_(pa.int64()), True)  # Optional, no default
 ])
 
