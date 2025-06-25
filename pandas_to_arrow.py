@@ -3,7 +3,7 @@ import pyarrow as pa
 import numpy as np
 from pyspark.sql.types import Row
 import json
-from typing import Any, List, Dict
+from typing import Any, List, Dict, Tuple
 
 def pandas_to_arrow_with_nested_schema(df: pd.DataFrame, schema: pa.Schema) -> pa.Table:
     """
@@ -13,8 +13,8 @@ def pandas_to_arrow_with_nested_schema(df: pd.DataFrame, schema: pa.Schema) -> p
     schema metadata. Supports PySpark Row objects.
     
     Args:
-        df (pd.DataFrame): Input pandas DataFrame, possibly containing Row objects.
-        schema (pa.Schema): Target PyArrow schema with possible nested types and default values
+        df (pd.DataFrame): Input pandas DataFrame, may contain Row objects.
+        schema (pa.Schema): Target PyArrow schema with nested types and default values
                            in metadata (e.g., {'default': 'value'}).
     
     Returns:
@@ -64,7 +64,7 @@ def pandas_to_arrow_with_nested_schema(df: pd.DataFrame, schema: pa.Schema) -> p
 def _parse_default_value(default_value: bytes, field_type: pa.DataType, field_name: str) -> Any:
     """
     Parse the default value from schema metadata based on the field type, including dictionary,
-    large_string, and large_list types.
+    large_string, large_list, and map types. Handles nested maps within structs.
     
     Args:
         default_value: Default value from metadata (as bytes).
@@ -72,7 +72,7 @@ def _parse_default_value(default_value: bytes, field_type: pa.DataType, field_na
         field_name: Name of the field for error reporting.
     
     Returns:
-        Parsed default value compatible with the field type.
+        Parsed default value compatible with the field type (e.g., list of tuples for maps).
     
     Raises:
         ValueError: If default value is invalid or incompatible with the field type.
@@ -96,11 +96,37 @@ def _parse_default_value(default_value: bytes, field_type: pa.DataType, field_na
             else:
                 raise ValueError(f"Unsupported dictionary value type '{value_type}' for field '{field_name}'")
         elif pa.types.is_struct(field_type):
-            return json.loads(default_str)  # Expect JSON string for structs
+            parsed = json.loads(default_str)
+            if not isinstance(parsed, dict):
+                raise ValueError(f"Expected dict for struct field '{field_name}', got {type(parsed)}")
+            result = {}
+            for subfield in field_type:
+                subfield_name = subfield.name
+                subfield_type = subfield.type
+                subfield_default = subfield.metadata.get(b'default', None) if subfield.metadata else None
+                value = parsed.get(subfield_name, None if pa.types.is_map(subfield_type) or subfield.nullable else None)
+                if value is not None:
+                    if pa.types.is_map(subfield_type) and isinstance(value, list):
+                        value = [tuple(item) if isinstance(item, list) and len(item) == 2 else item for item in value]
+                    result[subfield_name] = value
+                elif subfield_default is not None:
+                    result[subfield_name] = _parse_default_value(subfield_default, subfield_type, f"{field_name}.{subfield_name}")
+            return result
         elif pa.types.is_list(field_type) or pa.types.is_large_list(field_type):
-            return json.loads(default_str)  # Expect JSON string for lists/large_lists
+            return json.loads(default_str)
         elif pa.types.is_map(field_type):
-            return json.loads(default_str)  # Expect JSON string for maps (list of [key, value])
+            parsed = json.loads(default_str)
+            if not isinstance(parsed, list):
+                raise ValueError(f"Expected list of key-value pairs for map field '{field_name}', got {type(parsed)}")
+            result = []
+            for item in parsed:
+                if isinstance(item, list) and len(item) == 2:
+                    result.append(tuple(item))
+                elif isinstance(item, tuple) and len(item) == 2:
+                    result.append(item)
+                else:
+                    raise ValueError(f"Invalid map default pair {item} in '{field_name}': expected list/tuple of length 2")
+            return result
         elif pa.types.is_string(field_type) or pa.types.is_large_string(field_type):
             return default_str
         elif pa.types.is_integer(field_type):
@@ -110,7 +136,7 @@ def _parse_default_value(default_value: bytes, field_type: pa.DataType, field_na
         elif pa.types.is_boolean(field_type):
             return default_str.lower() == 'true'
         else:
-            raise ValueError(f"Unsupported field type '{field_type}' for default value in field '{field_name}'")
+            raise ValueError(f"Unsupported field type '{field_type}' for default value in '{field_name}'")
     except Exception as e:
         raise ValueError(f"Failed to parse default value '{default_str}' for field '{field_name}' with type {field_type}: {str(e)}")
 
@@ -149,11 +175,9 @@ def _convert_to_arrow_array(series: pd.Series, field_type: pa.DataType, field_na
     elif pa.types.is_map(field_type):
         return _convert_to_map_array(series, field_type, field_name, is_required, default_value)
     else:
-        # Handle primitive, dictionary, and large_string types
-        if is_required:
-            default_data = _parse_default_value(default_value, field_type, field_name) if default_value else None
-            if default_data is not None:
-                series = series.where(series.notna(), default_data)
+        if is_required and default_value is not None:
+            default_data = _parse_default_value(default_value, field_type, field_name)
+            series = series.where(series.notna(), default_data)
         try:
             return pa.array(series, type=field_type)
         except Exception as e:
@@ -206,13 +230,20 @@ def _convert_to_struct_array(series: pd.Series, struct_type: pa.StructType, fiel
                     if subfield_default is None:
                         raise ValueError(f"Required subfield '{field_name}.{subfield_name}' is None and has no default value")
                     value = _parse_default_value(subfield_default, subfield_type, f"{field_name}.{subfield_name}")
-                if value is not None and (pa.types.is_struct(subfield_type) or pa.types.is_list(subfield_type) or pa.types.is_large_list(subfield_type) or pa.types.is_map(subfield_type) or pa.types.is_dictionary(subfield_type)):
-                    # Recursively convert nested types
-                    sub_series = pd.Series([value]).where(~pd.Series([value]).isna(), None)
-                    sub_array = _convert_to_arrow_array(sub_series, subfield_type, f"{field_name}.{subfield_name}", subfield_required, subfield_default)
-                    record[subfield_name] = sub_array[0]
+                if value is not None:
+                    if pa.types.is_map(subfield_type) and isinstance(value, list):
+                        if len(value) == 2 and not all(isinstance(i, (list, tuple)) for i in value):
+                            value = [tuple(value)]
+                        else:
+                            value = [tuple(v) if isinstance(v, list) and len(v) == 2 else v for v in value]
+                    if pa.types.is_struct(subfield_type) or pa.types.is_list(subfield_type) or pa.types.is_large_list(subfield_type) or pa.types.is_map(subfield_type) or pa.types.is_dictionary(subfield_type):
+                        sub_series = pd.Series([value]).where(~pd.Series([value]).isna(), None)
+                        sub_array = _convert_to_arrow_array(sub_series, subfield_type, f"{field_name}.{subfield_name}", subfield_required, subfield_default)
+                        record[subfield_name] = sub_array[0]
+                    else:
+                        record[subfield_name] = value
                 else:
-                    record[subfield_name] = value
+                    record[subfield_name] = None
             records.append(record)
     
     try:
@@ -220,7 +251,7 @@ def _convert_to_struct_array(series: pd.Series, struct_type: pa.StructType, fiel
     except Exception as e:
         raise ValueError(f"Failed to convert column '{field_name}' to struct {struct_type}: {str(e)}")
 
-def _convert_to_list_array(series: pd.Series, list_type: pa.DataType, field_name: str, is_required: bool, default_value: bytes) -> pa.Array:
+def _convert_to_list_array(series: pd.Series, list_type: pa.ListType, field_name: str, is_required: bool, default_value: bytes) -> pa.Array:
     """
     Convert a pandas Series to a PyArrow list or large_list array, handling nested value types recursively.
     """
@@ -236,7 +267,7 @@ def _convert_to_list_array(series: pd.Series, list_type: pa.DataType, field_name
         return pa.array([None] * len(series), type=list_type)
     
     value_type = list_type.value_type
-    value_field = list_type.value_field  # Use value_field to get the Field object
+    value_field = list_type.value_field
     value_default = value_field.metadata.get(b'default', None) if value_field.metadata else None
     value_required = not value_field.nullable
     data = []
@@ -247,7 +278,7 @@ def _convert_to_list_array(series: pd.Series, list_type: pa.DataType, field_name
         if item is None:
             if is_required:
                 if default_data is None:
-                    raise ValueError(f"Required field '{field_name}' contains None and has no default value")
+                    raise ValueError(f"Required element in '{field_name}' is None and has no default value")
                 data.append(default_data)
             else:
                 data.append(None)
@@ -282,8 +313,8 @@ def _convert_to_list_array(series: pd.Series, list_type: pa.DataType, field_name
 def _convert_to_map_array(series: pd.Series, map_type: pa.MapType, field_name: str, is_required: bool, default_value: bytes) -> pa.Array:
     """
     Convert a pandas Series to a PyArrow map array, handling nested key/value types recursively.
+    Ensures map data is a list of tuples, including single lists like ['key', 'value'].
     """
-    # Replace pandas NA/NaN with None
     series = series.where(~series.isna(), None)
     
     if series.isna().all() or series.isnull().all():
@@ -295,10 +326,16 @@ def _convert_to_map_array(series: pd.Series, map_type: pa.MapType, field_name: s
         return pa.array([None] * len(series), type=map_type)
     
     key_type = map_type.key_type
-    value_type = map_type.item_type
-    value_field = pa.field("item", value_type, value_type.nullable)
-    value_default = value_field.metadata.get(b'default', None) if value_field.metadata else None
-    value_required = not value_field.nullable
+    value_field = map_type.item_type
+    if isinstance(value_field, pa.DataType):
+        value_type = value_field
+        value_field = pa.field('item', value_type, True)
+        value_default = None
+        value_required = False
+    else:
+        value_type = value_field.type
+        value_default = value_field.metadata.get(b'default', None) if value_field.metadata else None
+        value_required = not value_field.nullable
     data = []
     
     default_data = _parse_default_value(default_value, map_type, field_name) if default_value else None
@@ -314,12 +351,17 @@ def _convert_to_map_array(series: pd.Series, map_type: pa.MapType, field_name: s
         else:
             if isinstance(item, dict):
                 item = list(item.items())
+            if isinstance(item, list) and len(item) == 2 and not all(isinstance(i, (list, tuple)) for i in item):
+                item = [tuple(item)]
             if not isinstance(item, (list, tuple)):
-                raise ValueError(f"Expected dict or list of tuples for map field '{field_name}', got {type(item)} in {item}")
-            
-            # Process key-value pairs
+                raise ValueError(f"Expected dict, list of tuples, or single key-value list for map field '{field_name}', got {type(item)}: {item}")
             processed_pairs = []
-            for key, value in item:
+            for pair in item:
+                if isinstance(pair, list) and len(pair) == 2:
+                    pair = tuple(pair)
+                elif not isinstance(pair, tuple) or len(pair) != 2:
+                    raise ValueError(f"Invalid pair {pair} in map field '{field_name}': expected tuple or list of length 2")
+                key, value = pair
                 if value is None and value_required:
                     if value_default is None:
                         raise ValueError(f"Required map value in '{field_name}' is None and has no default value")
@@ -347,24 +389,30 @@ from pyspark.sql.types import Row
 df = pd.DataFrame({
     'id': [1, 2, 3],
     'vendorResult': [
-        Row(jumio=None, status=None, tags=['Tag1', None]),  # tags[1] and status use defaults
-        Row(jumio=Row(score=95, details='Verified'), status='Approved', tags=['Tag2', 'Tag3']),
-        None  # vendorResult uses default
+        Row(jumio=None, status=None, tags=['Tag1', None], metadata=[('key1', None)]),
+        Row(jumio=Row(status='Verified'), status='Approved', tags=['Tag2', 'Tag3'], metadata=[('key2', 'Value2')]),
+        None
+    ],
+    'simple_map': [
+        [('k1', None)],
+        [('key2', 'v2')],
+        None
     ]
 })
 
-# Sample schema with optional jumio, required large_string status, and required large_list tags
+# Sample schema
 schema = pa.schema([
-    ('id', pa.int64(), False, {b'default': b'0'}),  # Required with default 0
+    ('id', pa.int64(), False, {b'default': b'0'}),
     ('vendorResult', pa.struct([
         ('jumio', pa.struct([
-            ('score', pa.int64(), True),  # Optional
-            ('details', pa.string(), True)  # Optional
-        ]), True),  # Optional
-        ('status', pa.large_string(), False, {b'default': b'Pending'}),  # Required with default 'Pending'
-        ('tags', pa.large_list(pa.field('item', pa.large_string(), False, {b'default': b'Unknown'})), False, {b'default': b'["DefaultTag"]'})  # Required with default
-    ]), False, {b'default': b'{"jumio": null, "status": "Pending", "tags": ["DefaultTag"]}'}),
-    ('extra', pa.list_(pa.int64()), True)  # Optional, no default
+            ('status', pa.string(), True)
+        ]), True),
+        ('status', pa.large_string(), False, {b'default': b'Pending'}),
+        ('tags', pa.large_list(pa.field('item', pa.large_string(), False, {b'default': b'Unknown'})), False, {b'default': b'["DefaultTag"]'}),
+        ('metadata', pa.map_(pa.string(), pa.field('item', pa.large_string(), False, {b'default': b'Missing'})), False, {b'default': b'[["key", "Missing"]]'}),
+    ]), False, {b'default': b'{"jumio": null, "status": "Pending", "tags": ["DefaultTag"], "metadata": [["key", "Missing"]]}'}),
+    ('simple_map', pa.map_(pa.string(), pa.large_string()), True),
+    ('extra', pa.list_(pa.int64()), True)
 ])
 
 # Convert DataFrame to PyArrow Table
