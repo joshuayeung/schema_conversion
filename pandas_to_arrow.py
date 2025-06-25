@@ -236,9 +236,9 @@ def _convert_to_list_array(series: pd.Series, list_type: pa.DataType, field_name
         return pa.array([None] * len(series), type=list_type)
     
     value_type = list_type.value_type
-    value_field = pa.field("item", value_type, value_type.nullable)
+    value_field = list_type.value_field  # Use value_field to get the Field object
     value_default = value_field.metadata.get(b'default', None) if value_field.metadata else None
-    value_required = not value_type.nullable
+    value_required = not value_field.nullable
     data = []
     
     default_data = _parse_default_value(default_value, list_type, field_name) if default_value else None
@@ -298,7 +298,7 @@ def _convert_to_map_array(series: pd.Series, map_type: pa.MapType, field_name: s
     value_type = map_type.item_type
     value_field = pa.field("item", value_type, value_type.nullable)
     value_default = value_field.metadata.get(b'default', None) if value_field.metadata else None
-    value_required = not value_type.nullable
+    value_required = not value_field.nullable
     data = []
     
     default_data = _parse_default_value(default_value, map_type, field_name) if default_value else None
