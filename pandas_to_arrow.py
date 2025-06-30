@@ -3,14 +3,15 @@ import pyarrow as pa
 import numpy as np
 from pyspark.sql.types import Row
 import json
+from datetime import datetime, date, time
+from decimal import Decimal
 from typing import Any, List, Dict, Tuple
 
 def pandas_to_arrow_with_nested_schema(df: pd.DataFrame, schema: pa.Schema) -> pa.Table:
     """
     Convert a pandas DataFrame to a PyArrow Table, aligning with a schema that may include
-    multi-level nested types (struct, list, large_list, map_, dictionary, large_string).
-    Missing columns or None values in required fields are filled with default values from
-    schema metadata. Supports PySpark Row objects.
+    nested types (struct, list, large_list, map, dictionary, string, large_string, integer,
+    floating, boolean, timestamp, decimal, date, time, binary, large_binary).
     
     Args:
         df (pd.DataFrame): Input pandas DataFrame, may contain Row objects.
@@ -24,14 +25,12 @@ def pandas_to_arrow_with_nested_schema(df: pd.DataFrame, schema: pa.Schema) -> p
         ValueError: If DataFrame contains columns not in schema, data is incompatible, or
                     required fields lack default values when needed.
     """
-    # Validate DataFrame columns against schema
     df_columns = set(df.columns)
     schema_names = {field.name for field in schema}
     extra_columns = df_columns - schema_names
     if extra_columns:
         raise ValueError(f"DataFrame contains columns not in schema: {extra_columns}")
 
-    # Initialize list to store PyArrow arrays for each field
     arrays = []
     
     for field in schema:
@@ -41,30 +40,25 @@ def pandas_to_arrow_with_nested_schema(df: pd.DataFrame, schema: pa.Schema) -> p
         default_value = field.metadata.get(b'default', None) if field.metadata else None
         
         if field_name in df:
-            # Column exists in DataFrame, convert to PyArrow array
             column_data = df[field_name]
             array = _convert_to_arrow_array(column_data, field_type, field_name, is_required, default_value)
         else:
-            # Column missing
             if is_required:
                 if default_value is None:
                     raise ValueError(f"Required field '{field_name}' is missing and has no default value")
-                # Create array with default value
                 default_data = _parse_default_value(default_value, field_type, field_name)
                 array = pa.array([default_data] * len(df), type=field_type)
             else:
-                # Create null array for non-required missing fields
                 array = pa.array([None] * len(df), type=field_type)
         
         arrays.append(array)
     
-    # Create PyArrow Table from arrays
     return pa.Table.from_arrays(arrays, schema=schema)
 
 def _parse_default_value(default_value: bytes, field_type: pa.DataType, field_name: str) -> Any:
     """
     Parse the default value from schema metadata based on the field type, including dictionary,
-    large_string, large_list, and map types. Handles nested maps within structs.
+    large_string, large_list, map, struct, timestamp, decimal, date, time, binary, large_binary.
     
     Args:
         default_value: Default value from metadata (as bytes).
@@ -80,12 +74,10 @@ def _parse_default_value(default_value: bytes, field_type: pa.DataType, field_na
     if default_value is None:
         raise ValueError(f"No default value provided for required field '{field_name}'")
     
-    # Decode bytes to string
     default_str = default_value.decode('utf-8')
     
     try:
         if pa.types.is_dictionary(field_type):
-            # Handle dictionary (enum) type; default must match value_type
             value_type = field_type.value_type
             if pa.types.is_string(value_type) or pa.types.is_large_string(value_type):
                 return default_str
@@ -135,6 +127,16 @@ def _parse_default_value(default_value: bytes, field_type: pa.DataType, field_na
             return float(default_str)
         elif pa.types.is_boolean(field_type):
             return default_str.lower() == 'true'
+        elif pa.types.is_timestamp(field_type):
+            return pd.Timestamp(default_str, tz='UTC' if field_type.tz else None)
+        elif pa.types.is_decimal(field_type):
+            return Decimal(default_str)
+        elif pa.types.is_date(field_type):
+            return pd.to_datetime(default_str).date()
+        elif pa.types.is_time(field_type):
+            return datetime.strptime(default_str, '%H:%M:%S').time()
+        elif pa.types.is_binary(field_type) or pa.types.is_large_binary(field_type):
+            return default_str.encode('utf-8')
         else:
             raise ValueError(f"Unsupported field type '{field_type}' for default value in '{field_name}'")
     except Exception as e:
@@ -142,11 +144,11 @@ def _parse_default_value(default_value: bytes, field_type: pa.DataType, field_na
 
 def _convert_to_arrow_array(series: pd.Series, field_type: pa.DataType, field_name: str, is_required: bool, default_value: bytes) -> pa.Array:
     """
-    Convert a pandas Series to a PyArrow array, handling nested types recursively.
+    Convert a pandas Series to a PyArrow array, handling nested and primitive types recursively.
     
     Args:
         series: Pandas Series containing the data.
-        field_type: PyArrow data type (may be struct, list, large_list, map_, dictionary, large_string, or primitive).
+        field_type: PyArrow data type (e.g., struct, list, large_list, map, dictionary, timestamp, decimal).
         field_name: Name of the field for error reporting.
         is_required: Whether the field is required (non-nullable).
         default_value: Default value from schema metadata (as bytes).
@@ -157,7 +159,6 @@ def _convert_to_arrow_array(series: pd.Series, field_type: pa.DataType, field_na
     Raises:
         ValueError: If data is incompatible with the field type or required field lacks default.
     """
-    # Replace pandas NA/NaN with None
     series = series.where(~series.isna(), None)
     
     if series.isna().all() or series.isnull().all():
@@ -179,6 +180,22 @@ def _convert_to_arrow_array(series: pd.Series, field_type: pa.DataType, field_na
             default_data = _parse_default_value(default_value, field_type, field_name)
             series = series.where(series.notna(), default_data)
         try:
+            if pa.types.is_timestamp(field_type):
+                series = pd.to_datetime(series, format='ISO8601', utc=True)
+            elif pa.types.is_decimal(field_type):
+                series = series.apply(lambda x: Decimal(str(x)) if x is not None else None)
+            elif pa.types.is_date(field_type):
+                series = pd.to_datetime(series).apply(lambda x: x.date() if x is not None else None)
+            elif pa.types.is_time(field_type):
+                def parse_time(x):
+                    if x is None:
+                        return None
+                    if isinstance(x, time):
+                        return x
+                    return datetime.strptime(str(x), '%H:%M:%S').time()
+                series = series.apply(parse_time)
+            elif pa.types.is_binary(field_type) or pa.types.is_large_binary(field_type):
+                series = series.apply(lambda x: x.encode('utf-8') if isinstance(x, str) else x)
             return pa.array(series, type=field_type)
         except Exception as e:
             raise ValueError(f"Failed to convert column '{field_name}' to {field_type}: {str(e)}")
@@ -188,7 +205,6 @@ def _convert_to_struct_array(series: pd.Series, struct_type: pa.StructType, fiel
     Convert a pandas Series to a PyArrow struct array, handling nested fields recursively.
     Supports PySpark Row objects and dictionaries.
     """
-    # Replace pandas NA/NaN with None
     series = series.where(~series.isna(), None)
     
     if series.isna().all() or series.isnull().all():
@@ -199,7 +215,6 @@ def _convert_to_struct_array(series: pd.Series, struct_type: pa.StructType, fiel
             return pa.array([default_data] * len(series), type=struct_type)
         return pa.array([None] * len(series), type=struct_type)
     
-    # Extract struct fields
     struct_fields = {f.name: f.type for f in struct_type}
     records = []
     
@@ -214,14 +229,12 @@ def _convert_to_struct_array(series: pd.Series, struct_type: pa.StructType, fiel
             else:
                 records.append(None)
         else:
-            # Convert PySpark Row to dict if necessary
             if isinstance(item, Row):
                 item = item.asDict(recursive=True)
             if not isinstance(item, dict):
                 raise ValueError(f"Expected dict or Row for struct field '{field_name}', got {type(item)} in {item}")
             record = {}
             for subfield_name, subfield_type in struct_fields.items():
-                # Get subfield metadata
                 subfield = struct_type.field(subfield_name)
                 subfield_default = subfield.metadata.get(b'default', None) if subfield.metadata else None
                 subfield_required = not subfield.nullable
@@ -255,7 +268,6 @@ def _convert_to_list_array(series: pd.Series, list_type: pa.ListType, field_name
     """
     Convert a pandas Series to a PyArrow list or large_list array, handling nested value types recursively.
     """
-    # Replace pandas NA/NaN with None
     series = series.where(~series.isna(), None)
     
     if series.isna().all() or series.isnull().all():
@@ -285,7 +297,6 @@ def _convert_to_list_array(series: pd.Series, list_type: pa.ListType, field_name
         elif not isinstance(item, (list, tuple)):
             raise ValueError(f"Expected list or tuple for list field '{field_name}', got {type(item)} in {item}")
         else:
-            # Handle non-nullable elements
             processed_items = []
             for element in item:
                 if element is None and value_required:
@@ -295,7 +306,6 @@ def _convert_to_list_array(series: pd.Series, list_type: pa.ListType, field_name
                 processed_items.append(element)
             
             if pa.types.is_struct(value_type) or pa.types.is_list(value_type) or pa.types.is_large_list(value_type) or pa.types.is_map(value_type) or pa.types.is_dictionary(value_type):
-                # Recursively convert each element in the list
                 if len(processed_items) == 0:
                     data.append([])
                 else:
@@ -351,7 +361,7 @@ def _convert_to_map_array(series: pd.Series, map_type: pa.MapType, field_name: s
         else:
             if isinstance(item, dict):
                 item = list(item.items())
-            if isinstance(item, list) and len(item) == 2 and not all(isinstance(i, (list, tuple)) for i in item):
+            if isinstance(item, list) and len(item) == 2 and not all(isinstance(i, (list, tuple)) for i in value):
                 item = [tuple(item)]
             if not isinstance(item, (list, tuple)):
                 raise ValueError(f"Expected dict, list of tuples, or single key-value list for map field '{field_name}', got {type(item)}: {item}")
@@ -367,7 +377,6 @@ def _convert_to_map_array(series: pd.Series, map_type: pa.MapType, field_name: s
                         raise ValueError(f"Required map value in '{field_name}' is None and has no default value")
                     value = _parse_default_value(value_default, value_type, f"{field_name}.map.value")
                 if pa.types.is_struct(value_type) or pa.types.is_list(value_type) or pa.types.is_large_list(value_type) or pa.types.is_map(value_type) or pa.types.is_dictionary(value_type):
-                    # Recursively convert nested value type
                     sub_series = pd.Series([value]).where(~pd.Series([value]).isna(), None)
                     sub_array = _convert_to_arrow_array(sub_series, value_type, f"{field_name}.map.value", value_required, value_default)
                     processed_value = sub_array[0]
@@ -384,6 +393,8 @@ def _convert_to_map_array(series: pd.Series, map_type: pa.MapType, field_name: s
 import pandas as pd
 import pyarrow as pa
 from pyspark.sql.types import Row
+from datetime import datetime, date, time
+from decimal import Decimal
 
 # Sample DataFrame
 df = pd.DataFrame({
@@ -397,7 +408,13 @@ df = pd.DataFrame({
         [('k1', None)],
         [('key2', 'v2')],
         None
-    ]
+    ],
+    'timestamp_col': ['2025-06-30 12:00:00', None, '2025-06-30 14:00:00Z'],
+    'decimal_col': [123.45, None, 678.90],
+    'date_col': ['2025-06-30', None, '2025-07-01'],
+    'time_col': ['12:00:00', None, '14:30:00'],
+    'binary_col': [b'data1', None, b'data3'],
+    'large_binary_col': ['large_data1', None, 'large_data3']
 })
 
 # Sample schema
@@ -412,6 +429,12 @@ schema = pa.schema([
         ('metadata', pa.map_(pa.string(), pa.field('item', pa.large_string(), False, {b'default': b'Missing'})), False, {b'default': b'[["key", "Missing"]]'}),
     ]), False, {b'default': b'{"jumio": null, "status": "Pending", "tags": ["DefaultTag"], "metadata": [["key", "Missing"]]}'}),
     ('simple_map', pa.map_(pa.string(), pa.large_string()), True),
+    ('timestamp_col', pa.timestamp('us', tz='UTC'), False, {b'default': b'2025-01-01T00:00:00Z'}),
+    ('decimal_col', pa.decimal128(10, 2), False, {b'default': b'0.00'}),
+    ('date_col', pa.date32(), False, {b'default': b'2025-01-01'}),
+    ('time_col', pa.time64('us'), False, {b'default': b'00:00:00'}),
+    ('binary_col', pa.binary(), False, {b'default': b''}),
+    ('large_binary_col', pa.large_binary(), False, {b'default': b''}),
     ('extra', pa.list_(pa.int64()), True)
 ])
 
